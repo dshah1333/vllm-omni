@@ -555,6 +555,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     inter_stage_output,
                     request,
                     is_segment_finished,
+                    new_token_ids=new_token_ids,
                 )
 
         self._remove_stopped_requests_from_queues(

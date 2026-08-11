@@ -333,6 +333,30 @@ def test_send_single_request_struct_without_meta_does_not_crash(build_adapter, m
     assert cleanup_calls == []  # no terminal cleanup; meta.finished is false
 
 
+def test_send_single_request_passes_step_token_snapshot_when_supported(build_adapter):
+    adapter, connector = build_adapter(stage_id=0)
+    request = _req("req-step-token", RequestStatus.WAITING, external_req_id="ext-step-token")
+    observed: dict[str, object] = {}
+
+    def processor(*, new_token_ids, **kwargs):
+        observed["new_token_ids"] = tuple(new_token_ids)
+        return OmniPayloadStruct()
+
+    adapter.custom_process_next_stage_input_func = processor
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": False,
+            "new_token_ids": (123,),
+        }
+    )
+
+    assert connector.put.called
+    assert observed["new_token_ids"] == (123,)
+
+
 def test_send_single_request_empty_struct_goes_on_wire(build_adapter, monkeypatch):
     """Pin the contract: an explicitly empty ``OmniPayloadStruct()`` passes
     the ``payload_data is None`` check and gets sent. To skip a chunk, the
@@ -1235,7 +1259,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     )
     scheduler.requests = {"req-ar": request}
 
-    scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
+    scheduler._update_request_with_output = mocker.MagicMock(return_value=([123], True))
     scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
     scheduler._free_request = mocker.MagicMock(return_value=(None, None))
@@ -1269,6 +1293,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
 
     assert len(cleanup_calls) == 0
     assert len(save_calls) == 1
+    assert save_calls[0][1]["new_token_ids"] == [123]
 
 
 def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
