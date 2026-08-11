@@ -217,6 +217,7 @@ def _streaming_request(prompt_len: int, generated: list[int], info: dict | None 
         prompt_token_ids=list(range(100, 100 + prompt_len)) + [_PAD],
         output_token_ids=generated,
         additional_information=info,
+        model_intermediate_buffer=None,
     )
 
 
@@ -241,6 +242,35 @@ def test_thinker2talker_async_chunk_cumulative_timeline() -> None:
     payload = thinker2talker_async_chunk(tm, {}, req, is_finished=True)
     assert payload.ids.all == [_PAD] * 3 + [7, 8, 9]
     assert bool(payload.meta.finished)
+
+
+def test_thinker2talker_native_duplex_uses_runner_payload_and_stays_resumable() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        thinker2talker_async_chunk,
+    )
+
+    tm = _fake_transfer_manager()
+    req = _streaming_request(prompt_len=1, generated=[])
+    req.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "runtime_config": {
+                "nvc_prompt_token_ids": [0, 41, 42, 1],
+            },
+        }
+    }
+
+    # Resumable cleanup clears request.output_token_ids before the connector
+    # thread runs, so the immutable per-step snapshot is authoritative.
+    payload = thinker2talker_async_chunk(tm, {}, req, is_finished=True, new_token_ids=[7])
+
+    assert payload.ids.all == [_PAD] * 4 + [7]
+    # ids.prompt extends the parked downstream scheduler request by one wake.
+    assert payload.ids.prompt == [0]
+    assert payload.meta.codec_streaming is True
+    assert payload.meta.request_id == "req-0"
+    # A Stage-0 segment boundary is not terminal for a native duplex session.
+    assert not bool(payload.meta.finished)
 
 
 def test_talker2code2wav_async_chunk_cadence_and_left_context() -> None:
@@ -356,6 +386,27 @@ def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id
     }
 
 
+def test_talker_output_keeps_streaming_codec_identity_on_wire() -> None:
+    talker = _bare_talker()
+    output = talker.make_omni_output(
+        torch.zeros((1, talker._hidden)),
+        model_intermediate_buffer=[
+            {
+                "codes": {"audio": torch.zeros((1, 31), dtype=torch.long)},
+                "meta": {
+                    "nvc_logical_prompt_len": 3,
+                    "codec_streaming": torch.tensor(True),
+                    "request_id": "req-duplex",
+                },
+            }
+        ],
+    )
+
+    meta = output.multimodal_outputs["meta"]
+    assert meta["nvc_logical_prompt_len"].item() == 3
+    assert meta["codec_streaming"].item() is True
+
+
 def test_talker_drains_all_received_positions_per_wake() -> None:
     """P2: chunk 0's PAD prompt region must not cost one upstream chunk per step,
     and P1: a coalesced chunk (2+ new positions, 1 wake) must be fully drained."""
@@ -373,7 +424,7 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info)
     assert session["step"] == prompt_len  # t advanced 1 -> P in one wake
     assert update["codes"]["audio"].shape == (prompt_len - 1, 31)
-    assert float(embeds[0, 0]) == 0.0  # not finished
+    assert float(embeds[0, 0]) == 1.0  # current scheduler segment is drained
 
     # Coalesced chunk: TWO new frame tokens arrive in ONE wake (delayed save
     # thread merged two thinker steps). Both must be consumed by this wake.
@@ -381,14 +432,14 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update["codes"]["audio"].shape == (prompt_len + 1, 31)
-    assert float(embeds[0, 0]) == 0.0
+    assert float(embeds[0, 0]) == 1.0
 
-    # Zero-progress wake (no new positions, not finished): plain CONTINUE, no
-    # fabricated frames, no codes update.
+    # Zero-progress wake: never fabricate frames. The stop flag parks this
+    # resumable scheduler request until another connector chunk arrives.
     _, embeds, update = talker.preprocess(ids, None, _omni_is_prefill=False, **info2)
     assert session["step"] == prompt_len + 2
     assert update == {}
-    assert float(embeds[0, 0]) == 0.0
+    assert float(embeds[0, 0]) == 1.0
 
     # Final chunk: one more token + finished marker -> drain + stop flag.
     info3 = _async_info([pad] * prompt_len + [7, 8, 9], prompt_len, finished=True)

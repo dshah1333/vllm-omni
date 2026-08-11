@@ -164,6 +164,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
         codes_list: list[torch.Tensor] = []
         prompt_len: int | None = None
+        codec_streaming = False
         for info in info_dicts:
             if not isinstance(info, dict):
                 continue
@@ -177,16 +178,34 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 reported = info.get("meta.nvc_logical_prompt_len")
             if reported is not None:
                 prompt_len = int(reported)
+            streaming = meta.get("codec_streaming") if isinstance(meta, dict) else None
+            if streaming is None:
+                streaming = info.get("meta.codec_streaming")
+            if hasattr(streaming, "item"):
+                streaming = streaming.item()
+            codec_streaming = codec_streaming or streaming is True
         if not codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
-        outputs: dict[str, Any] = {"codes": {"audio": torch.cat(codes_list, dim=0)}}
+        codes = torch.cat(codes_list, dim=0)
+        logger.debug(
+            "Nemotron VoiceChat talker emitted codes: shapes=%s combined=%s prompt_len=%s",
+            [tuple(item.shape) for item in codes_list],
+            tuple(codes.shape),
+            prompt_len,
+        )
+        outputs: dict[str, Any] = {"codes": {"audio": codes}}
         # The prompt length must ride the WIRE payload (multimodal_outputs):
         # the async-chunk dispatcher hands exactly this dict to the
         # talker2code2wav producer, while request.additional_information is
         # overwritten concurrently by arriving thinker chunks.
+        output_meta: dict[str, Any] = {}
         if prompt_len is not None:
             # 1-D on purpose: the wire-payload builder indexes element.shape[0].
-            outputs["meta"] = {"nvc_logical_prompt_len": torch.tensor([prompt_len], dtype=torch.long)}
+            output_meta["nvc_logical_prompt_len"] = torch.tensor([prompt_len], dtype=torch.long)
+        if codec_streaming:
+            output_meta["codec_streaming"] = torch.tensor([True], dtype=torch.bool)
+        if output_meta:
+            outputs["meta"] = output_meta
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=outputs,
@@ -281,6 +300,11 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 "meta.num_processed_tokens); the code2wav producer cannot trim the "
                 "prompt-region codes without it."
             )
+        meta = info.get("meta")
+        codec_streaming = bool(
+            (isinstance(meta, dict) and meta.get("codec_streaming") is True) or info.get("meta.codec_streaming") is True
+        )
+        codec_request_id = meta.get("request_id") if isinstance(meta, dict) else None
         session = {
             "timeline": timeline,
             "prompt_len": prompt_len,
@@ -291,6 +315,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             "tts_initialized": False,
             "generation_config": generation_config,
             "codes_rows": [],
+            "codec_streaming": codec_streaming,
+            "codec_request_id": codec_request_id,
             # Sync mode ships the whole timeline up front via
             # nvc_text_timeline; async-chunk mode grows it across chunks and
             # the last chunk sets meta.finished.
@@ -348,10 +374,10 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         session["code"] = code
         session["past_key_values"] = past_key_values
         session["step"] = t + 1
-        # Async mode: exhausting the received timeline only ends the request
-        # once the upstream marked its final chunk; otherwise more entries are
-        # in flight and the scheduler parks us until they arrive.
-        finished = (t + 1) >= int(session["timeline"].numel()) and bool(session["upstream_finished"])
+        # Exhausting the currently received timeline ends this scheduler
+        # segment. A resumable async-chunk request is then parked with its
+        # model-side TTS state intact until the next thinker frame arrives.
+        finished = (t + 1) >= int(session["timeline"].numel())
         return code.reshape(1, -1).to(torch.long), finished
 
     def preprocess(
@@ -388,22 +414,28 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         #     chunk each.
         finished = False
         steps_run = 0
+        new_code_rows: list[torch.Tensor] = []
         while int(session["step"]) < int(session["timeline"].numel()):
             codes_row, finished = self._step_session(session)
-            session["codes_rows"].append(codes_row.cpu())
+            new_code_rows.append(codes_row.cpu())
+            if not session["codec_streaming"]:
+                session["codes_rows"].append(codes_row.cpu())
             steps_run += 1
             if session["sync_mode"]:
                 break
         if steps_run == 0:
             # Zero-progress wake (duplicate/terminal-marker chunk): no TTS step
-            # was run, so emit a plain CONTINUE placeholder — never a
-            # fabricated frame. The request finishes only when the upstream is
-            # exhausted AND the timeline is fully consumed.
-            finished = bool(session["upstream_finished"])
+            # was run, so never fabricate a frame. Stop the current scheduler
+            # segment when its timeline is already consumed; a resumable
+            # request will wake again when the connector provides more input.
+            finished = int(session["step"]) >= int(session["timeline"].numel())
             if finished:
                 embeds[:, 0] = 1.0
             return input_ids, embeds, {}
-        cumulative = torch.cat(session["codes_rows"], dim=0)
+        cumulative = torch.cat(
+            new_code_rows if session["codec_streaming"] else session["codes_rows"],
+            dim=0,
+        )
         if finished:
             embeds[:, 0] = 1.0  # stop flag -> compute_logits emits the stop token
         info_update: dict[str, Any] = {
@@ -413,7 +445,12 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             # chunks and by these model updates, so the async code2wav producer
             # reads the prompt length from the per-step multimodal_output
             # instead of racing the request-level dict.
-            "meta": {"nvc_tts_step": int(session["step"]), "nvc_logical_prompt_len": int(session["prompt_len"])},
+            "meta": {
+                "nvc_tts_step": int(session["step"]),
+                "nvc_logical_prompt_len": int(session["prompt_len"]),
+                "codec_streaming": bool(session["codec_streaming"]),
+                "request_id": session["codec_request_id"],
+            },
         }
         return input_ids, embeds, info_update
 

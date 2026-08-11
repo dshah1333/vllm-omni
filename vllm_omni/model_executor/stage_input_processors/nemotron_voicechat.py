@@ -51,6 +51,27 @@ def _info_get(info: Any, key: str) -> Any:
     return None
 
 
+def _request_info(request: Any) -> dict[str, Any]:
+    """Return the live runner payload, accepting both transport generations."""
+    for name in (
+        "model_intermediate_buffer",
+        "additional_information",
+        "additional_information_cpu",
+    ):
+        info = getattr(request, name, None)
+        if isinstance(info, dict):
+            return info
+        if info is not None and hasattr(info, "entries"):
+            from vllm_omni.engine.serialization import (
+                deserialize_additional_information,
+            )
+
+            decoded = deserialize_additional_information(info)
+            if isinstance(decoded, dict):
+                return decoded
+    return {}
+
+
 def thinker2talker_token_only(
     source_outputs: list,
     prompt: Any = None,
@@ -118,32 +139,59 @@ def thinker2talker_async_chunk(
     the payload self-contained. ``meta.num_processed_tokens`` carries the
     logical prompt length for the code2wav producer's prompt-region trim.
     """
-    del multimodal_output, kwargs
+    del multimodal_output
+    generated_delta = [int(token_id) for token_id in (kwargs.pop("new_token_ids", ()) or ())]
     request_id = request.external_req_id
+    request_info = _request_info(request)
+    duplex_info = request_info.get("duplex") if isinstance(request_info, dict) else None
+    is_duplex = isinstance(duplex_info, dict) and duplex_info.get("data_plane") is True
+
+    state = transfer_manager.request_payload.get(request_id)
+    generated_now = [int(token_id) for token_id in (getattr(request, "output_token_ids", None) or [])]
     prompt_ids = list(getattr(request, "prompt_token_ids", None) or [])
-    # vLLM prompt = logical prompt + 1 placeholder (acoustic frame 0).
-    logical_prompt_len = max(len(prompt_ids) - 1, 0)
-    generated = list(getattr(request, "output_token_ids", None) or [])
+    if is_duplex:
+        runtime_config = duplex_info.get("runtime_config")
+        runtime_prompt = runtime_config.get("nvc_prompt_token_ids") if isinstance(runtime_config, dict) else None
+        if not isinstance(runtime_prompt, list | tuple) or not runtime_prompt:
+            raise ValueError("Nemotron VoiceChat duplex stage transfer lacks nvc_prompt_token_ids")
+        logical_prompt_len = len(runtime_prompt)
+        previous = list(state.get("nvc_duplex_text_tokens", ())) if isinstance(state, dict) else []
+        if generated_delta:
+            generated = previous + generated_delta
+        elif generated_now[: len(previous)] == previous and len(generated_now) > len(previous):
+            generated = generated_now
+        elif generated_now:
+            generated = previous + [generated_now[-1]]
+        else:
+            generated = previous
+    else:
+        # vLLM prompt = logical prompt + 1 placeholder (acoustic frame 0).
+        logical_prompt_len = max(len(prompt_ids) - 1, 0)
+        generated = generated_now
     pad_id = _DEFAULT_TEXT_PAD_ID
-    reported_pad = _info_get(getattr(request, "additional_information", None), "nvc_text_pad_id")
+    reported_pad = _info_get(request_info, "nvc_text_pad_id")
     if reported_pad is not None:
         pad_id = int(reported_pad)
-    timeline = [pad_id] * logical_prompt_len + [int(t) for t in generated]
+    timeline = [pad_id] * logical_prompt_len + generated
 
     # Skip no-progress wakeups (same length as the last emitted chunk).
-    state = transfer_manager.request_payload.get(request_id)
     last_len = int(state.get("nvc_timeline_len", -1)) if isinstance(state, dict) else -1
     if len(timeline) <= last_len and not is_finished:
         return None
-    transfer_manager.request_payload[request_id] = {"nvc_timeline_len": len(timeline)}
+    transfer_manager.request_payload[request_id] = {
+        "nvc_timeline_len": len(timeline),
+        "nvc_duplex_text_tokens": generated if is_duplex else (),
+    }
 
     return OmniPayloadStruct(
-        ids=IdsStruct(all=timeline),
+        ids=IdsStruct(all=timeline, prompt=[0]),
         meta=MetaStruct(
-            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+            finished=torch.tensor(bool(is_finished and not is_duplex), dtype=torch.bool),
             num_processed_tokens=logical_prompt_len,
             # The talker's vLLM prompt stays a single placeholder token.
             next_stage_prompt_len=1,
+            codec_streaming=is_duplex,
+            request_id=request_id if is_duplex else None,
         ),
     )
 
@@ -167,6 +215,10 @@ def talker2code2wav_async_chunk(
     """
     del kwargs
     request_id = request.external_req_id
+    request_info = _request_info(request)
+    codec_streaming = (
+        _info_get(request_info, "codec_streaming") is True or _info_get(multimodal_output, "codec_streaming") is True
+    )
 
     codes = None
     if isinstance(multimodal_output, dict):
@@ -177,7 +229,10 @@ def talker2code2wav_async_chunk(
     if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
         if not is_finished:
             return None
-        return _empty_finished_payload()
+        return _empty_finished_payload(
+            codec_streaming=codec_streaming,
+            request_id=request_id,
+        )
     if codes.ndim == 1:
         codes = codes.reshape(1, -1)
 
@@ -191,10 +246,9 @@ def talker2code2wav_async_chunk(
     if prompt_len is None and isinstance(multimodal_output, dict):
         prompt_len = multimodal_output.get("meta.nvc_logical_prompt_len")
     if prompt_len is None:
-        info = getattr(request, "additional_information", None)
-        prompt_len = _info_get(info, "nvc_logical_prompt_len")
+        prompt_len = _info_get(request_info, "nvc_logical_prompt_len")
         if prompt_len is None:
-            prompt_len = _info_get(info, "num_processed_tokens")
+            prompt_len = _info_get(request_info, "num_processed_tokens")
     if prompt_len is None and isinstance(state, dict):
         prompt_len = state.get("nvc_prompt_len")
     if prompt_len is None:
@@ -203,10 +257,13 @@ def talker2code2wav_async_chunk(
             "('nvc_logical_prompt_len' or async meta.num_processed_tokens); cannot "
             "trim the prompt-region codes for streaming code2wav."
         )
-    trimmed = codes[max(int(prompt_len) - 1, 0) :]
-
     frames_sent = int(state.get("nvc_frames_sent", 0)) if isinstance(state, dict) else 0
-    new_frames = int(trimmed.shape[0]) - frames_sent
+    if codec_streaming and frames_sent > 0:
+        # The duplex talker emits only rows produced by this wake.
+        trimmed = codes
+    else:
+        trimmed = codes[max(int(prompt_len) - 1, 0) :]
+    new_frames = int(trimmed.shape[0]) if codec_streaming else int(trimmed.shape[0]) - frames_sent
     if new_frames <= 0 and not is_finished:
         return None
 
@@ -219,25 +276,39 @@ def talker2code2wav_async_chunk(
     if new_frames <= 0 and is_finished and frames_sent > 0:
         # Everything already shipped; emit a terminal empty chunk so the
         # code2wav request observes meta.finished.
-        return _empty_finished_payload()
+        return _empty_finished_payload(
+            codec_streaming=codec_streaming,
+            request_id=request_id,
+        )
 
     transfer_manager.request_payload[request_id] = {
-        "nvc_frames_sent": int(trimmed.shape[0]),
+        "nvc_frames_sent": frames_sent + new_frames if codec_streaming else int(trimmed.shape[0]),
         "nvc_prompt_len": int(prompt_len),
     }
+    code_payload = trimmed
     return OmniPayloadStruct(
-        codes=CodesStruct(audio=trimmed.detach().to(dtype=torch.long, device="cpu")),
+        codes=CodesStruct(audio=code_payload.detach().to(dtype=torch.long, device="cpu")),
         meta=MetaStruct(
-            left_context_size=frames_sent,
+            left_context_size=0 if codec_streaming else frames_sent,
+            codec_streaming=codec_streaming,
+            request_id=request_id if codec_streaming else None,
             finished=torch.tensor(bool(is_finished), dtype=torch.bool),
         ),
     )
 
 
-def _empty_finished_payload() -> OmniPayloadStruct:
+def _empty_finished_payload(
+    *,
+    codec_streaming: bool = False,
+    request_id: str | None = None,
+) -> OmniPayloadStruct:
     return OmniPayloadStruct(
         codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
-        meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
+        meta=MetaStruct(
+            finished=torch.tensor(True, dtype=torch.bool),
+            codec_streaming=codec_streaming,
+            request_id=request_id if codec_streaming else None,
+        ),
     )
 
 

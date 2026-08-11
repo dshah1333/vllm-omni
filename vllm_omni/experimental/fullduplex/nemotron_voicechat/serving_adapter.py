@@ -1,0 +1,274 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Realtime serving adapter for Nemotron VoiceChat native duplex."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections.abc import Callable, Mapping
+from copy import deepcopy
+from typing import Any
+
+from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.nemotron_voicechat.data_plane import (
+    NemotronVoiceChatDataPlaneContext,
+    NemotronVoiceChatDataPlaneSession,
+)
+from vllm_omni.experimental.fullduplex.nemotron_voicechat.input import (
+    NemotronVoiceChatInputController,
+)
+from vllm_omni.experimental.fullduplex.openai.protocol import DuplexCapabilities
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    DuplexInputCompletionMode,
+    ServingRuntimeConfigError,
+    ServingRuntimeSessionState,
+)
+
+EncodeAudio = Callable[[object, int, str, float | None], str | None]
+
+_DEFAULT_SYSTEM_PROMPT = (
+    "You are an AI voice assistant developed by NVIDIA. "
+    "Your name is NVIDIA Voice Chat. "
+    "Answer in a spoken, conversational style rather than a written one. "
+    "Do not repeat the same sentence over and over again. "
+    "Start the conversation by greeting the user."
+)
+_PRIVATE_KEYS = frozenset(
+    {
+        "nvc_prompt_token_ids",
+        "nvc_text_bos_id",
+        "nvc_text_eos_id",
+        "nvc_text_pad_id",
+        "nvc_function_sotc_id",
+        "nvc_function_eotc_id",
+        "nvc_function_eotr_id",
+        "nvc_tokenizer_ref",
+        "nvc_tools_signature",
+    }
+)
+
+
+def _stt_config(model_config: Any) -> dict[str, Any]:
+    hf_config = getattr(model_config, "hf_config", None)
+    stt_cfg = getattr(hf_config, "stt_cfg", None)
+    if not isinstance(stt_cfg, dict):
+        raise ServingRuntimeConfigError("Nemotron VoiceChat checkpoint STT configuration is unavailable")
+    return stt_cfg
+
+
+def _normalized_tools(config: object) -> tuple[list[dict[str, object]], str]:
+    extra_body = getattr(config, "extra_body", None)
+    raw_tools = extra_body.get("realtime_tools") if isinstance(extra_body, dict) else None
+    if raw_tools is None:
+        return [], "[]"
+    if not isinstance(raw_tools, list):
+        raise ServingRuntimeConfigError("Nemotron VoiceChat tools must be a list")
+    if len(raw_tools) > 5:
+        raise ServingRuntimeConfigError("Nemotron VoiceChat supports at most 5 tools per session")
+
+    normalized: list[dict[str, object]] = []
+    for index, tool in enumerate(raw_tools):
+        if not isinstance(tool, dict):
+            raise ServingRuntimeConfigError(f"Nemotron VoiceChat tool {index} must be an object")
+        function = tool.get("function", tool)
+        if not isinstance(function, dict):
+            raise ServingRuntimeConfigError(f"Nemotron VoiceChat tool {index} has no function definition")
+        definition = {key: value for key, value in function.items() if key != "type"}
+        if not isinstance(definition.get("name"), str) or not str(definition["name"]).strip():
+            raise ServingRuntimeConfigError(f"Nemotron VoiceChat tool {index} requires a name")
+        normalized.append(definition)
+    signature = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return normalized, signature
+
+
+def _render_tool_prompt(instructions: str, tools: list[dict[str, object]]) -> str:
+    if not tools:
+        return instructions
+    available = json.dumps(tools, ensure_ascii=False, sort_keys=True)
+    return (
+        f"{instructions}\n\n"
+        "You can use the following tools to assist the user if required:"
+        f"\n<AVAILABLE_TOOLS>{available}</AVAILABLE_TOOLS>\n\n"
+        "If you decide to call any tool(s), use the following format:\n"
+        '<TOOLCALL>[{"name": "tool_name1", "arguments": "tool_args1"}, '
+        '{"name": "tool_name2", "arguments": "tool_args2"}]</TOOLCALL>\n\n'
+        "The user will execute tool-calls and return responses from tool(s) in this format:\n"
+        '<TOOL_RESPONSE>[{"tool_response1"}, {"tool_response2"}]</TOOL_RESPONSE>\n\n'
+        "Based on the tool responses, you can call additional tools if needed, correct tool calls if any "
+        "errors are found, or just respond to the user."
+    )
+
+
+def _tokenize_runtime(model_config: Any, instructions: str) -> dict[str, object]:
+    from transformers import AutoTokenizer
+
+    stt_cfg = _stt_config(model_config)
+    tokenizer_ref = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or stt_cfg.get(
+        "pretrained_llm", "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=False)
+
+    def token(name: str, default: str) -> int:
+        return int(tokenizer.convert_tokens_to_ids(stt_cfg.get(name, default)))
+
+    bos_id = token("bos_token", "<s>")
+    eos_id = token("eos_token", "</s>")
+    pad_id = token("pad_token", "<SPECIAL_12>")
+    prompt_ids = [bos_id] + list(tokenizer.encode(instructions, add_special_tokens=False)) + [eos_id]
+    return {
+        "instructions": instructions,
+        "nvc_prompt_token_ids": prompt_ids,
+        "nvc_text_bos_id": bos_id,
+        "nvc_text_eos_id": eos_id,
+        "nvc_text_pad_id": pad_id,
+        "nvc_function_sotc_id": int(tokenizer.convert_tokens_to_ids("<SPECIAL_20>")),
+        "nvc_function_eotc_id": int(tokenizer.convert_tokens_to_ids("<SPECIAL_21>")),
+        "nvc_function_eotr_id": int(tokenizer.convert_tokens_to_ids("<SPECIAL_22>")),
+        "nvc_tokenizer_ref": str(tokenizer_ref),
+    }
+
+
+class NemotronVoiceChatServingRuntimeAdapter:
+    adapter_id = "nemotron_voicechat"
+    # The next audio frame must not overtake the previous sampled text token:
+    # that token is the next frame's additive-fusion input.
+    input_completion_mode = DuplexInputCompletionMode.OUTPUT_PROJECTED
+    clean_response_done_prefix = ""
+    interrupted_tts_prefix = ""
+    private_runtime_config_keys = _PRIVATE_KEYS
+
+    def __init__(self, encode_audio: EncodeAudio) -> None:
+        self.input_controller = NemotronVoiceChatInputController()
+        self.session_states: dict[str, ServingRuntimeSessionState] = {}
+        self.data_plane = NemotronVoiceChatDataPlaneSession(encode_audio)
+
+    def create_session_state(self) -> ServingRuntimeSessionState:
+        return ServingRuntimeSessionState(
+            input_state=self.input_controller.create_state(),
+        )
+
+    def session_state(self, session_id: str) -> ServingRuntimeSessionState:
+        return self.session_states.setdefault(session_id, self.create_session_state())
+
+    def remove_session_state(self, session_id: str) -> None:
+        self.session_states.pop(session_id, None)
+
+    @staticmethod
+    def is_enabled(config: object) -> bool:
+        del config
+        return True
+
+    @staticmethod
+    def capabilities(*, max_sessions: int) -> DuplexCapabilities:
+        supports_multi_session = max_sessions > 1
+        return DuplexCapabilities(
+            supports_model_native_turn_policy=True,
+            supports_external_turn_signal=False,
+            supports_client_commit=True,
+            supports_barge_in=False,
+            supports_playback_ack=True,
+            supports_input_append=True,
+            supports_replace_latest_chunk=False,
+            supports_reencode_context=False,
+            supports_rollback_to_checkpoint=False,
+            supports_turn_commit_only=False,
+            supports_kv_lease=False,
+            supports_core_kv_lease=False,
+            supports_model_internal_state=True,
+            supports_stage_resumption=True,
+            supports_scheduler_native_append=False,
+            supports_core_resumable_request=True,
+            supports_stage_connector_handoff=True,
+            supports_independent_io_streams=True,
+            supports_realtime_endpoint=True,
+            supports_multi_session=supports_multi_session,
+            supports_multi_session_same_replica=False,
+            supports_session_lease=True,
+            supports_session_resume=True,
+            session_admission_mode="engine_managed",
+            supports_audio_truncate=False,
+            requires_model_runner_kv=True,
+            requires_native_stage_role=True,
+            implementation_level="model_native_duplex",
+            adapter_patterns=["scheduler_data_plane"],
+            input_modes=["append_audio_chunk"],
+            signal_sources=["model_native", "client_event"],
+            stage_handoff_transport="scheduler_data_plane",
+            chunk_period_ms=80,
+            target_barge_in_latency_ms=None,
+        )
+
+    @staticmethod
+    def validate_client_extra_body(extra_body: object) -> None:
+        if not isinstance(extra_body, dict):
+            return
+        private = sorted(_PRIVATE_KEYS.intersection(extra_body))
+        if private:
+            raise ServingRuntimeConfigError(
+                "Nemotron VoiceChat runtime configuration is server-owned: " + ", ".join(private)
+            )
+
+    @classmethod
+    async def prepare_runtime_config(
+        cls,
+        config: object,
+        *,
+        model_config: Any,
+    ) -> dict[str, object]:
+        cls.validate_client_extra_body(getattr(config, "extra_body", None))
+        instructions = str(getattr(config, "instructions", None) or _DEFAULT_SYSTEM_PROMPT)
+        tools, tools_signature = _normalized_tools(config)
+        rendered_prompt = _render_tool_prompt(instructions, tools)
+        runtime = await asyncio.to_thread(_tokenize_runtime, model_config, rendered_prompt)
+        # Keep raw session values for immutable-in-incarnation update checks;
+        # only the rendered prompt token ids enter Stage-0 KV.
+        runtime["instructions"] = instructions
+        runtime["nvc_tools_signature"] = tools_signature
+        return runtime
+
+    @staticmethod
+    def runtime_config_for_update(
+        config: object,
+        current: Mapping[str, object],
+    ) -> dict[str, object]:
+        NemotronVoiceChatServingRuntimeAdapter.validate_client_extra_body(getattr(config, "extra_body", None))
+        runtime = deepcopy(dict(current))
+        instructions = str(getattr(config, "instructions", None) or _DEFAULT_SYSTEM_PROMPT)
+        _, tools_signature = _normalized_tools(config)
+        # The system/tool prompt is already resident in Stage-0 KV. Updating it
+        # without a new incarnation would make the advertised config disagree
+        # with model state, so reject such updates explicitly.
+        if runtime and instructions != runtime.get("instructions"):
+            raise ServingRuntimeConfigError(
+                "Nemotron VoiceChat instructions cannot change inside an active duplex incarnation"
+            )
+        if runtime and tools_signature != runtime.get("nvc_tools_signature", "[]"):
+            raise ServingRuntimeConfigError(
+                "Nemotron VoiceChat tools cannot change inside an active duplex incarnation"
+            )
+        return runtime
+
+    @staticmethod
+    def data_plane_context(
+        *,
+        fence: DuplexFence,
+        source_input_seq: int,
+        auto_responds: bool,
+        response_format: str,
+        speed: float | None,
+        modalities: tuple[str, ...],
+    ) -> NemotronVoiceChatDataPlaneContext:
+        return NemotronVoiceChatDataPlaneContext(
+            fence=fence,
+            source_input_seq=source_input_seq,
+            auto_responds=auto_responds,
+            response_format=response_format,
+            speed=speed,
+            modalities=modalities,
+        )
+
+
+__all__ = ["NemotronVoiceChatServingRuntimeAdapter"]
