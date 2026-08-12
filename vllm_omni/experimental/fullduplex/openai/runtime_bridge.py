@@ -135,7 +135,9 @@ class NativeRuntimeBridgeMixin:
                     incarnation=session.incarnation,
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
-                append_kwargs["collect_outputs"] = False
+                append_kwargs["collect_outputs"] = bool(
+                    getattr(self._serving_runtime_adapter, "collect_outputs_on_append", False)
+                )
             result = await append_input(session.session_id, **append_kwargs)
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -825,6 +827,18 @@ class NativeRuntimeBridgeMixin:
                         "playback": session.playback.as_dict(),
                     }
                 )
+            return close_reason, True
+        if native_result.get("function_call") is True:
+            await send_json(
+                {
+                    "type": "function_call.done",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "call_id": native_result.get("call_id"),
+                    "name": native_result.get("name"),
+                    "arguments": native_result.get("arguments", ""),
+                }
+            )
             return close_reason, True
         if native_result.get("requires_stage_handoff") is True or native_result.get("requires_tts_stage") is True:
             # Stage0 announces a talker handoff before Stage1 has produced

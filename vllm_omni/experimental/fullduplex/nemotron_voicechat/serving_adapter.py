@@ -12,20 +12,18 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Any
 
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+from vllm_omni.experimental.fullduplex.minicpmo45.session import (
+    MiniCPMO45ServingSessionState,
+)
 from vllm_omni.experimental.fullduplex.nemotron_voicechat.data_plane import (
     NemotronVoiceChatDataPlaneContext,
     NemotronVoiceChatDataPlaneSession,
 )
 from vllm_omni.experimental.fullduplex.nemotron_voicechat.input import (
-    NemotronVoiceChatInputController,
+    NemotronVoiceChatPcmAppendBuffer,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import DuplexCapabilities
-from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
-    DuplexInputCompletionMode,
-    ServingRuntimeConfigError,
-    ServingRuntimeSessionState,
-)
+from vllm_omni.experimental.fullduplex.openai.runtime_adapter import ServingRuntimeConfigError
 
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
@@ -135,22 +133,23 @@ class NemotronVoiceChatServingRuntimeAdapter:
     adapter_id = "nemotron_voicechat"
     # The next audio frame must not overtake the previous sampled text token:
     # that token is the next frame's additive-fusion input.
-    input_completion_mode = DuplexInputCompletionMode.OUTPUT_PROJECTED
+    # Frame N+1 consumes the text token sampled by frame N, so acknowledge an
+    # input only after its projected scheduler output is available.
+    collect_outputs_on_append = True
     clean_response_done_prefix = ""
     interrupted_tts_prefix = ""
     private_runtime_config_keys = _PRIVATE_KEYS
 
     def __init__(self, encode_audio: EncodeAudio) -> None:
-        self.input_controller = NemotronVoiceChatInputController()
-        self.session_states: dict[str, ServingRuntimeSessionState] = {}
+        self.session_states: dict[str, MiniCPMO45ServingSessionState] = {}
         self.data_plane = NemotronVoiceChatDataPlaneSession(encode_audio)
 
-    def create_session_state(self) -> ServingRuntimeSessionState:
-        return ServingRuntimeSessionState(
-            input_state=self.input_controller.create_state(),
+    def create_session_state(self) -> MiniCPMO45ServingSessionState:
+        return MiniCPMO45ServingSessionState(
+            audio_buffer=NemotronVoiceChatPcmAppendBuffer(),
         )
 
-    def session_state(self, session_id: str) -> ServingRuntimeSessionState:
+    def session_state(self, session_id: str) -> MiniCPMO45ServingSessionState:
         return self.session_states.setdefault(session_id, self.create_session_state())
 
     def remove_session_state(self, session_id: str) -> None:
@@ -254,16 +253,19 @@ class NemotronVoiceChatServingRuntimeAdapter:
     @staticmethod
     def data_plane_context(
         *,
-        fence: DuplexFence,
-        source_input_seq: int,
+        epoch: int,
+        turn_id: int,
+        active_response_turn_id: int | None,
+        active_response_id: str | None,
         auto_responds: bool,
         response_format: str,
         speed: float | None,
         modalities: tuple[str, ...],
     ) -> NemotronVoiceChatDataPlaneContext:
+        del active_response_turn_id, active_response_id
         return NemotronVoiceChatDataPlaneContext(
-            fence=fence,
-            source_input_seq=source_input_seq,
+            epoch=epoch,
+            turn_id=turn_id,
             auto_responds=auto_responds,
             response_format=response_format,
             speed=speed,

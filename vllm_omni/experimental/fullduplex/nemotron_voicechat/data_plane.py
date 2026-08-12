@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Typed output projection for Nemotron VoiceChat's independent channels."""
+"""Output projection for Nemotron VoiceChat's independent channels."""
 
 from __future__ import annotations
 
@@ -16,17 +16,7 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
-    DuplexOutputContext,
     duplex_resource_request_belongs_to_session,
-)
-from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-from vllm_omni.experimental.fullduplex.engine.model_events import (
-    DuplexFunctionCallDelta,
-    DuplexFunctionCallEnd,
-    DuplexFunctionCallStart,
-    DuplexModelEvent,
-    DuplexOutputLedger,
-    DuplexSideChannelLedger,
 )
 from vllm_omni.experimental.fullduplex.output import (
     get_duplex_output_context,
@@ -35,14 +25,13 @@ from vllm_omni.experimental.fullduplex.output import (
 
 logger = init_logger(__name__)
 
-
 EncodeAudio = Callable[[object, int, str, float | None], str | None]
 
 
 @dataclass(frozen=True, slots=True)
 class NemotronVoiceChatDataPlaneContext:
-    fence: DuplexFence = field(default_factory=lambda: DuplexFence("unbound"))
-    source_input_seq: int = 0
+    epoch: int = 0
+    turn_id: int = 0
     auto_responds: bool = True
     response_format: str = "wav"
     speed: float | None = None
@@ -54,6 +43,7 @@ class _RequestState:
     pending_speech_end: bool = False
     function_active: bool = False
     function_tokens: list[int] = field(default_factory=list)
+    function_call_id: str | None = None
     terminal: bool = False
 
 
@@ -110,10 +100,7 @@ def _multimodal(output: object, completion: object | None) -> dict[str, object]:
 
 
 def _audio_value(metadata: Mapping[str, object]) -> object | None:
-    value = next(
-        (metadata[key] for key in ("audio", "model_outputs", "latent") if key in metadata),
-        None,
-    )
+    value = next((metadata[key] for key in ("audio", "model_outputs", "latent") if key in metadata), None)
     if isinstance(value, list) and len(value) == 1:
         return value[0]
     return value
@@ -145,8 +132,6 @@ class NemotronVoiceChatDataPlaneSession:
     def __init__(self, encode_audio: EncodeAudio) -> None:
         self._encode_audio = encode_audio
         self._requests: dict[str, _RequestState] = {}
-        self._output_ledgers: dict[tuple[str, int], DuplexOutputLedger] = {}
-        self._side_ledgers: dict[tuple[str, int], DuplexSideChannelLedger] = {}
         self._tokenizer = None
         self._special_ids: dict[str, int] | None = None
 
@@ -168,26 +153,6 @@ class NemotronVoiceChatDataPlaneSession:
         for request_id in tuple(self._requests):
             if duplex_resource_request_belongs_to_session(request_id, session_id):
                 self._requests.pop(request_id, None)
-        for key in tuple(self._output_ledgers):
-            if key[0] == session_id:
-                self._output_ledgers.pop(key, None)
-                self._side_ledgers.pop(key, None)
-
-    def _ledgers(self, fence: DuplexFence) -> tuple[DuplexOutputLedger, DuplexSideChannelLedger]:
-        key = (fence.session_id, fence.incarnation)
-        output = self._output_ledgers.get(key)
-        side = self._side_ledgers.get(key)
-        if output is None:
-            output = DuplexOutputLedger(fence)
-            side = DuplexSideChannelLedger(fence)
-            self._output_ledgers[key] = output
-            self._side_ledgers[key] = side
-        elif output.fence.epoch < fence.epoch:
-            output.advance_epoch(fence)
-            assert side is not None
-            side.advance_epoch(fence)
-        assert side is not None
-        return output, side
 
     def _load_tokenizer(self):
         if self._tokenizer is None:
@@ -219,7 +184,7 @@ class NemotronVoiceChatDataPlaneSession:
         result: object,
         *,
         context: NemotronVoiceChatDataPlaneContext | None = None,
-    ) -> Iterator[DuplexModelEvent]:
+    ) -> Iterator[dict[str, object]]:
         if not isinstance(result, dict):
             return
         outputs = result.get("data_plane_outputs")
@@ -233,29 +198,24 @@ class NemotronVoiceChatDataPlaneSession:
         output: object,
         *,
         context: NemotronVoiceChatDataPlaneContext | None = None,
-    ) -> Iterator[DuplexModelEvent]:
+    ) -> Iterator[dict[str, object]]:
         context = context or NemotronVoiceChatDataPlaneContext()
         output_context = get_duplex_output_context(output)
-        if isinstance(output_context, DuplexOutputContext):
-            fence = output_context.identity.fence
-            source_input_seq = output_context.source_input_seq
-        else:
-            fence = context.fence
-            source_input_seq = context.source_input_seq
-        if fence != context.fence:
+        output_fence = getattr(getattr(output_context, "identity", None), "fence", None)
+        if output_fence is not None and output_fence.epoch != context.epoch:
             logger.debug(
-                "Nemotron VoiceChat dropped stale output: output_fence=%s active_fence=%s stage=%s",
-                fence,
-                context.fence,
+                "Nemotron VoiceChat dropped stale output: output_epoch=%s active_epoch=%s stage=%s",
+                output_fence.epoch,
+                context.epoch,
                 getattr(output, "stage_id", None),
             )
             return
 
         outer = output
         output, completion, stage_id = _unwrap(output)
-        output_ledger, side_ledger = self._ledgers(fence)
         request_id = getattr(output, "request_id", None) or getattr(outer, "request_id", None)
-        state = self._requests.setdefault(str(request_id), _RequestState())
+        request_id = str(request_id) if request_id is not None else ""
+        state = self._requests.setdefault(request_id, _RequestState())
         metadata = _multimodal(outer, completion)
         ids = self._ids()
 
@@ -265,130 +225,99 @@ class NemotronVoiceChatDataPlaneSession:
                 text_ids = _coerce_ints(
                     getattr(completion, "token_ids", None) or getattr(completion, "cumulative_token_ids", None)
                 )
-            logger.debug(
-                "Nemotron VoiceChat duplex text output: stage=%s request=%s source_seq=%s text_ids=%s function=%s",
-                stage_id,
-                request_id,
-                source_input_seq,
-                text_ids,
-                _coerce_ints(metadata.get("nvc_function_token")),
-            )
             for token_id in text_ids[-1:]:
-                if token_id == ids["bos"]:
-                    if output_ledger.active_output_id is None:
-                        yield output_ledger.emit_start(source_input_seq=source_input_seq)
-                elif token_id == ids["eos"]:
+                if token_id == ids["eos"]:
                     state.pending_speech_end = True
                 elif token_id == ids["pad"]:
-                    if output_ledger.active_output_id is None:
-                        yield output_ledger.emit_listen(source_input_seq=source_input_seq)
-                else:
+                    yield {
+                        "stage_role": "llm",
+                        "is_listen": True,
+                        "model_listen": True,
+                        "listen_source": "model_listen",
+                        "data_plane_request_id": request_id,
+                        "end_of_turn": False,
+                    }
+                elif token_id != ids["bos"]:
                     text = self._decode([token_id])
                     if text:
-                        yield from output_ledger.emit_chunk(
-                            source_input_seq=source_input_seq,
-                            text_delta=text,
-                        )
+                        yield {
+                            "stage_role": "llm",
+                            "is_listen": False,
+                            "data_plane_request_id": request_id,
+                            "text": text,
+                            "end_of_turn": False,
+                        }
 
-            function_ids = _coerce_ints(metadata.get("nvc_function_token"))
-            for function_id in function_ids[-1:]:
+            for function_id in _coerce_ints(metadata.get("nvc_function_token"))[-1:]:
                 yield from self._project_function_token(
                     function_id,
                     state=state,
-                    side_ledger=side_ledger,
-                    fence=fence,
-                    source_input_seq=source_input_seq,
+                    request_id=request_id,
                     ids=ids,
                 )
             return
 
         audio = _audio_value(metadata)
+        sample_rate = _sample_rate(metadata)
         sample_count = _audio_samples(audio)
-        encoded = self._encode_audio(
-            audio,
-            _sample_rate(metadata),
-            context.response_format,
-            context.speed,
-        )
-        logger.debug(
-            "Nemotron VoiceChat duplex stage output: stage=%s request=%s metadata=%s samples=%s encoded=%s",
-            stage_id,
-            request_id,
-            sorted(metadata),
-            sample_count,
-            bool(encoded),
-        )
+        encoded = self._encode_audio(audio, sample_rate, context.response_format, context.speed)
+        segment_finished = bool(getattr(output_context, "segment_finished", False))
+        end_of_turn = state.pending_speech_end and segment_finished
         if encoded:
-            # Text and codec stages run independently. Codec output is
-            # authoritative evidence of speech and may race ahead of the BOS
-            # side-channel event, so never drop valid audio while waiting for
-            # that event to create the ledger entry.
-            if output_ledger.active_output_id is None:
-                yield output_ledger.emit_start(source_input_seq=source_input_seq)
-            yield from output_ledger.emit_chunk(
-                source_input_seq=source_input_seq,
-                audio_data=encoded,
-                audio_format=context.response_format,
-                sample_rate_hz=_sample_rate(metadata),
-                audio_duration_ms=round(sample_count * 1000 / max(1, _sample_rate(metadata))),
-            )
-        segment_finished = bool(isinstance(output_context, DuplexOutputContext) and output_context.segment_finished)
-        if state.pending_speech_end and segment_finished and output_ledger.active_output_id is not None:
+            yield {
+                "stage_role": "tts",
+                "is_listen": False,
+                "data_plane_request_id": request_id,
+                "text": "",
+                "audio_data": encoded,
+                "audio_format": context.response_format,
+                "sample_rate_hz": sample_rate,
+                "audio_duration_ms": round(sample_count * 1000 / max(1, sample_rate)),
+                "audio_text_mark": True,
+                "end_of_turn": end_of_turn,
+            }
+        elif end_of_turn:
+            yield {
+                "stage_role": "tts",
+                "is_listen": False,
+                "data_plane_request_id": request_id,
+                "text": "",
+                "end_of_turn": True,
+            }
+        if end_of_turn:
             state.pending_speech_end = False
-            yield output_ledger.emit_end()
 
     def _project_function_token(
         self,
         token_id: int,
         *,
         state: _RequestState,
-        side_ledger: DuplexSideChannelLedger,
-        fence: DuplexFence,
-        source_input_seq: int,
+        request_id: str,
         ids: Mapping[str, int],
-    ) -> Iterator[DuplexModelEvent]:
+    ) -> Iterator[dict[str, object]]:
         if token_id == ids["sotc"]:
             state.function_active = True
             state.function_tokens.clear()
+            state.function_call_id = f"call_{uuid4().hex}"
             return
         if token_id == ids["eotc"] and state.function_active:
             state.function_active = False
             raw = self._decode(state.function_tokens)
             state.function_tokens.clear()
             for call in self._parse_calls(raw):
-                name = str(call.get("name") or "unknown")
-                arguments = call.get("arguments", {})
-                arguments_text = (
-                    arguments if isinstance(arguments, str) else json.dumps(arguments, separators=(",", ":"))
-                )
-                call_id = f"call_{uuid4().hex}"
-                start = DuplexFunctionCallStart(
-                    fence=fence,
-                    source_input_seq=source_input_seq,
-                    call_id=call_id,
-                    name=name,
-                )
-                if side_ledger.accept(start):
-                    yield start
-                if arguments_text:
-                    delta = DuplexFunctionCallDelta(
-                        fence=fence,
-                        call_id=call_id,
-                        function_seq=0,
-                        arguments_delta=arguments_text,
-                    )
-                    if side_ledger.accept(delta):
-                        yield delta
-                    end_seq = 1
-                else:
-                    end_seq = 0
-                end = DuplexFunctionCallEnd(
-                    fence=fence,
-                    call_id=call_id,
-                    function_seq=end_seq,
-                )
-                if side_ledger.accept(end):
-                    yield end
+                yield {
+                    "stage_role": "function",
+                    "data_plane_request_id": request_id,
+                    "function_call": True,
+                    "call_id": state.function_call_id or f"call_{uuid4().hex}",
+                    "name": str(call.get("name") or "unknown"),
+                    "arguments": (
+                        call.get("arguments")
+                        if isinstance(call.get("arguments"), str)
+                        else json.dumps(call.get("arguments", {}), separators=(",", ":"))
+                    ),
+                }
+            state.function_call_id = None
             return
         if state.function_active and token_id != ids["pad"]:
             state.function_tokens.append(token_id)

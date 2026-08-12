@@ -11,7 +11,6 @@ from vllm.sampling_params import SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
-    DuplexExecutionProfile,
     DuplexInputMode,
     DuplexOutputAction,
     DuplexOutputDecision,
@@ -33,13 +32,6 @@ def _plain_token_ids(value: object, *, name: str) -> list[int]:
 
 class NemotronVoiceChatDuplexRuntimeExtension:
     """Append one 80 ms acoustic frame to one resumable thinker request."""
-
-    @staticmethod
-    def execution_profile() -> DuplexExecutionProfile:
-        return DuplexExecutionProfile(
-            prewarm_batch_sizes=(1,),
-            step_latency_budget_ms=80.0,
-        )
 
     def configure_sampling_params(
         self,
@@ -69,13 +61,14 @@ class NemotronVoiceChatDuplexRuntimeExtension:
         fence: DuplexFence,
         session_config: dict[str, Any],
         runtime_config: dict[str, Any],
-        input_seq: int,
+        seq: int,
+        turn_seq: int,
         mode: DuplexInputMode,
         payload: object,
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        del sampling_params
+        del sampling_params, turn_seq
         if mode is not DuplexInputMode.APPEND_AUDIO_CHUNK:
             raise ValueError(f"Nemotron VoiceChat does not support duplex input mode {mode.value!r}")
         decode_pcm_f32le(payload, exact_frame=True)
@@ -88,7 +81,7 @@ class NemotronVoiceChatDuplexRuntimeExtension:
             pad_id = int(runtime_config["nvc_text_pad_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("Nemotron VoiceChat runtime requires nvc_text_pad_id") from exc
-        scheduler_prompt = prompt_ids + [pad_id] if input_seq <= 1 else [pad_id]
+        scheduler_prompt = prompt_ids + [pad_id] if seq <= 1 else [pad_id]
         return DuplexAppendPlan(
             prompt={
                 "prompt_token_ids": scheduler_prompt,
@@ -101,8 +94,8 @@ class NemotronVoiceChatDuplexRuntimeExtension:
                         "session_id": fence.session_id,
                         "incarnation": fence.incarnation,
                         "epoch": fence.epoch,
-                        "source_input_seq": input_seq,
-                        "seq": input_seq,
+                        "source_input_seq": seq,
+                        "seq": seq,
                         "mode": mode.value,
                         "payload": normalized_payload,
                         "final": final,

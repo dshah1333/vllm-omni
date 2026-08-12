@@ -7,19 +7,8 @@ from __future__ import annotations
 
 import base64
 import binascii
-from dataclasses import dataclass, field
 
 import numpy as np
-
-from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
-    DuplexInputAppendCommand,
-    DuplexInputClearCommand,
-    DuplexInputCloseCommand,
-    DuplexInputCommitCommand,
-    DuplexInputEffect,
-    DuplexInputFlushCommand,
-    DuplexInputSnapshot,
-)
 
 NEMOTRON_VOICECHAT_SAMPLE_RATE = 16000
 NEMOTRON_VOICECHAT_FRAME_SAMPLES = 1280
@@ -43,29 +32,30 @@ def decode_pcm_f32le(payload: object, *, exact_frame: bool = False) -> bytes:
         raise ValueError("Nemotron VoiceChat duplex audio is not valid base64") from exc
     if len(raw) % _SAMPLE_BYTES:
         raise ValueError("Nemotron VoiceChat pcm_f32le payload has a partial sample")
+    values = np.frombuffer(raw, dtype="<f4")
+    if values.size and not bool(np.isfinite(values).all()):
+        raise ValueError("Nemotron VoiceChat duplex audio samples must be finite")
     if exact_frame and len(raw) != _FRAME_BYTES:
         raise ValueError(
             f"Nemotron VoiceChat native duplex append must contain exactly {NEMOTRON_VOICECHAT_FRAME_SAMPLES} samples"
         )
-    values = np.frombuffer(raw, dtype="<f4")
-    if values.size and not bool(np.isfinite(values).all()):
-        raise ValueError("Nemotron VoiceChat duplex audio samples must be finite")
     return raw
 
 
-@dataclass(slots=True)
-class NemotronVoiceChatInputState:
-    buffer: bytearray = field(default_factory=bytearray)
-    reservations: list[NemotronVoiceChatInputReservation] = field(default_factory=list)
-    input_since_commit: bool = False
-    speech_since_commit: bool = False
-    flush_seq: int = 0
+def _frame_payload(raw: bytes, *, final: bool) -> dict[str, object]:
+    return {
+        "type": "audio",
+        "audio": base64.b64encode(raw).decode("ascii"),
+        "format": "pcm_f32le",
+        "sample_rate_hz": NEMOTRON_VOICECHAT_SAMPLE_RATE,
+        "final": final,
+    }
 
 
-class NemotronVoiceChatInputReservation:
+class NemotronVoiceChatPcmAppendReservation:
     def __init__(
         self,
-        owner: NemotronVoiceChatInputState,
+        owner: NemotronVoiceChatPcmAppendBuffer,
         *,
         operation_id: str,
         payload: dict[str, object] | None,
@@ -89,191 +79,137 @@ class NemotronVoiceChatInputReservation:
         if not self._active:
             return
         self._active = False
-        if self in self._owner.reservations:
-            self._owner.reservations.remove(self)
+        if self in self._owner._reservations:
+            self._owner._reservations.remove(self)
 
     def rollback(self) -> None:
         if not self._active:
             return
         try:
-            index = self._owner.reservations.index(self)
+            index = self._owner._reservations.index(self)
         except ValueError:
             self._active = False
             return
         restore = bytearray()
-        for reservation in self._owner.reservations[index:]:
+        for reservation in self._owner._reservations[index:]:
             if reservation._active:
                 restore.extend(reservation.raw)
                 reservation._active = False
-        del self._owner.reservations[index:]
-        self._owner.buffer[:0] = restore
+        del self._owner._reservations[index:]
+        self._owner._buffer[:0] = restore
 
 
-def _frame_payload(raw: bytes, *, final: bool) -> dict[str, object]:
-    return {
-        "type": "audio",
-        "audio": base64.b64encode(raw).decode("ascii"),
-        "format": "pcm_f32le",
-        "sample_rate_hz": NEMOTRON_VOICECHAT_SAMPLE_RATE,
-        "final": final,
-    }
+class NemotronVoiceChatPcmAppendBuffer:
+    """Adapt Realtime packets to the current full-duplex PCM buffer contract.
 
+    The model consumes exactly one 1280-sample frame per scheduler append.
+    Realtime packets may split a frame arbitrarily, but a single packet is
+    capped at one frame so the serving contract never silently drops a second
+    ready frame behind a single-reservation API.
+    """
 
-class NemotronVoiceChatInputController:
-    """Turn arbitrary browser packets into ordered, rollback-safe 80 ms frames."""
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._reservations: list[NemotronVoiceChatPcmAppendReservation] = []
 
-    @staticmethod
-    def create_state() -> NemotronVoiceChatInputState:
-        return NemotronVoiceChatInputState()
+    @property
+    def pending_byte_count(self) -> int:
+        return len(self._buffer)
 
-    @staticmethod
-    def _state(state: object) -> NemotronVoiceChatInputState:
-        if not isinstance(state, NemotronVoiceChatInputState):
-            raise TypeError("invalid Nemotron VoiceChat serving input state")
-        return state
+    def clear(self) -> None:
+        for reservation in self._reservations:
+            reservation._active = False
+        self._reservations.clear()
+        self._buffer.clear()
 
-    def snapshot(self, state: object) -> DuplexInputSnapshot:
-        state = self._state(state)
-        return DuplexInputSnapshot(
-            pending_byte_count=len(state.buffer),
-            has_pending=bool(state.buffer),
-            has_reserved=any(reservation.active for reservation in state.reservations),
-            input_since_commit=state.input_since_commit,
-            speech_since_commit=state.speech_since_commit,
-        )
+    def clear_force_listen(self) -> None:
+        # Nemotron VoiceChat has no serving-side force-listen packet bit.
+        return
 
-    @staticmethod
-    def _reserve_available(
-        state: NemotronVoiceChatInputState,
+    def has_pending(self) -> bool:
+        return bool(self._buffer)
+
+    def has_reserved(self) -> bool:
+        return any(reservation.active for reservation in self._reservations)
+
+    def _reserve_frame(
+        self,
         *,
         operation_id: str,
         final: bool,
-    ) -> DuplexInputEffect:
-        payloads: list[object] = []
-        reservations: list[NemotronVoiceChatInputReservation] = []
-        frame_index = 0
-        while len(state.buffer) >= _FRAME_BYTES:
-            raw = bytes(state.buffer[:_FRAME_BYTES])
-            del state.buffer[:_FRAME_BYTES]
-            payload = _frame_payload(raw, final=final and len(state.buffer) < _FRAME_BYTES)
-            reservation = NemotronVoiceChatInputReservation(
-                state,
-                operation_id=f"{operation_id}:{frame_index}",
-                payload=payload,
-                raw=raw,
-            )
-            state.reservations.append(reservation)
-            payloads.append(payload)
-            reservations.append(reservation)
-            frame_index += 1
-        return DuplexInputEffect(
-            append_payloads=tuple(payloads),
-            reservations=tuple(reservations),
+    ) -> NemotronVoiceChatPcmAppendReservation | None:
+        if len(self._buffer) < _FRAME_BYTES:
+            return None
+        raw = bytes(self._buffer[:_FRAME_BYTES])
+        del self._buffer[:_FRAME_BYTES]
+        reservation = NemotronVoiceChatPcmAppendReservation(
+            self,
+            operation_id=operation_id,
+            payload=_frame_payload(raw, final=final),
+            raw=raw,
         )
+        self._reservations.append(reservation)
+        return reservation
 
-    def append(
+    def prepare_append(
         self,
-        state: object,
-        command: DuplexInputAppendCommand,
-    ) -> DuplexInputEffect:
-        state = self._state(state)
-        raw = decode_pcm_f32le(command.payload)
-        state.buffer.extend(raw)
-        state.input_since_commit = state.input_since_commit or bool(raw)
-        if not command.allow_emit:
-            return DuplexInputEffect()
-        return self._reserve_available(
-            state,
-            operation_id=command.operation_id,
-            final=False,
-        )
+        payload: dict[str, object],
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+        allow_emit: bool,
+    ) -> NemotronVoiceChatPcmAppendReservation | None:
+        if chunk_period_ms != 80:
+            raise ValueError("Nemotron VoiceChat native duplex chunk_period_ms must be 80")
+        raw = decode_pcm_f32le(payload)
+        if len(raw) > _FRAME_BYTES:
+            raise ValueError("Nemotron VoiceChat Realtime append must contain at most 1280 samples")
+        self._buffer.extend(raw)
+        if not allow_emit:
+            return None
+        return self._reserve_frame(operation_id=operation_id, final=False)
 
-    def commit(
+    def prepare_commit(
         self,
-        state: object,
-        command: DuplexInputCommitCommand,
-    ) -> DuplexInputEffect:
-        state = self._state(state)
-        if not state.buffer:
-            reservation = NemotronVoiceChatInputReservation(
-                state,
-                operation_id=command.operation_id,
+        *,
+        operation_id: str,
+        chunk_period_ms: int,
+    ) -> NemotronVoiceChatPcmAppendReservation:
+        if chunk_period_ms != 80:
+            raise ValueError("Nemotron VoiceChat native duplex chunk_period_ms must be 80")
+        if not self._buffer:
+            reservation = NemotronVoiceChatPcmAppendReservation(
+                self,
+                operation_id=operation_id,
                 payload=None,
                 raw=b"",
             )
-            state.reservations.append(reservation)
-            state.input_since_commit = False
-            state.speech_since_commit = False
-            return DuplexInputEffect(reservations=(reservation,))
-        raw = bytes(state.buffer)
-        state.buffer.clear()
-        padded = raw + bytes(_FRAME_BYTES - len(raw))
-        payload = _frame_payload(padded, final=True)
-        reservation = NemotronVoiceChatInputReservation(
-            state,
-            operation_id=command.operation_id,
-            payload=payload,
-            raw=raw,
-        )
-        state.reservations.append(reservation)
-        state.input_since_commit = False
-        state.speech_since_commit = False
-        return DuplexInputEffect(
-            append_payloads=(payload,),
-            reservations=(reservation,),
-        )
+        else:
+            raw = bytes(self._buffer)
+            self._buffer.clear()
+            reservation = NemotronVoiceChatPcmAppendReservation(
+                self,
+                operation_id=operation_id,
+                payload=_frame_payload(raw + bytes(_FRAME_BYTES - len(raw)), final=True),
+                raw=raw,
+            )
+        self._reservations.append(reservation)
+        return reservation
 
-    def clear(
-        self,
-        state: object,
-        command: DuplexInputClearCommand,
-    ) -> DuplexInputEffect:
-        state = self._state(state)
-        del command
-        released = len(state.buffer)
-        state.buffer.clear()
-        for reservation in state.reservations:
-            if reservation.active:
-                released += reservation.byte_count
-                reservation._active = False
-        state.reservations.clear()
-        state.input_since_commit = False
-        state.speech_since_commit = False
-        return DuplexInputEffect(released_bytes=released)
-
-    def flush(
-        self,
-        state: object,
-        command: DuplexInputFlushCommand,
-    ) -> DuplexInputEffect:
-        state = self._state(state)
-        del command
-        if not state.buffer:
-            return DuplexInputEffect()
-        raw = bytes(state.buffer)
-        state.buffer.clear()
-        state.flush_seq += 1
-        return DuplexInputEffect(
-            append_payloads=(_frame_payload(raw + bytes(_FRAME_BYTES - len(raw)), final=True),),
-        )
-
-    def close(
-        self,
-        state: object,
-        command: DuplexInputCloseCommand,
-    ) -> DuplexInputEffect:
-        del command
-        return self.clear(
-            state,
-            DuplexInputClearCommand(reason="session_close"),
-        )
+    def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
+        if chunk_period_ms != 80:
+            raise ValueError("Nemotron VoiceChat native duplex chunk_period_ms must be 80")
+        if not self._buffer:
+            return None
+        raw = bytes(self._buffer)
+        self._buffer.clear()
+        return _frame_payload(raw + bytes(_FRAME_BYTES - len(raw)), final=True)
 
 
 __all__ = [
     "NEMOTRON_VOICECHAT_FRAME_SAMPLES",
     "NEMOTRON_VOICECHAT_SAMPLE_RATE",
-    "NemotronVoiceChatInputController",
-    "NemotronVoiceChatInputReservation",
-    "NemotronVoiceChatInputState",
+    "NemotronVoiceChatPcmAppendBuffer",
+    "NemotronVoiceChatPcmAppendReservation",
     "decode_pcm_f32le",
 ]
