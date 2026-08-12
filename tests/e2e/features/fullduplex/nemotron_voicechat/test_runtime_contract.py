@@ -63,6 +63,7 @@ def test_pipeline_enables_model_native_duplex_plugins() -> None:
         "vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter.NemotronVoiceChatServingRuntimeAdapter"
     )
     assert NemotronVoiceChatServingRuntimeAdapter.silence_continuation_samples == 1280
+    assert NemotronVoiceChatServingRuntimeAdapter.collect_outputs_on_append is False
 
 
 def test_duplex_deploy_profile_is_one_frame_per_segment() -> None:
