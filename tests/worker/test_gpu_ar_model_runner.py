@@ -281,6 +281,26 @@ def test_resolve_pooler_payload_req_ids_text_terminal_stage_drops_payload():
     assert payload_req_ids == []
 
 
+def test_terminal_text_model_can_retain_client_multimodal_payload():
+    runner = _make_runner(engine_output_type="text", downstream_req_ids=set())
+    runner.model = SimpleNamespace(omni_client_multimodal_output_keys=("function_tokens",))
+
+    engine_output_type, payload_req_ids = GPUARModelRunner._resolve_pooler_payload_req_ids(runner, ["r1", "r2"])
+    payloads = GPUARModelRunner._build_multimodal_outputs(
+        runner,
+        [
+            {"function_tokens": torch.tensor([11])},
+            {"function_tokens": torch.tensor([22])},
+        ],
+    )
+
+    assert engine_output_type == "text"
+    assert payload_req_ids == ["r1", "r2"]
+    assert payloads is not None
+    assert payloads[0]["function_tokens"].tolist() == [11]
+    assert payloads[1]["function_tokens"].tolist() == [22]
+
+
 def test_resolve_pooler_payload_req_ids_downstream_stage_uses_filtered_requests():
     runner = _make_runner(engine_output_type="latent", downstream_req_ids={"r2"})
 

@@ -131,6 +131,7 @@ def _tokenize_runtime(model_config: Any, instructions: str) -> dict[str, object]
 
 class NemotronVoiceChatServingRuntimeAdapter:
     adapter_id = "nemotron_voicechat"
+    silence_continuation_samples = 1280
     # The next audio frame must not overtake the previous sampled text token:
     # that token is the next frame's additive-fusion input.
     # Frame N+1 consumes the text token sampled by frame N, so acknowledge an

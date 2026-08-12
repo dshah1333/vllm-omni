@@ -317,16 +317,21 @@ class NativeRuntimeBridgeMixin:
         native.data_plane_task = task
         return True
 
-    # One model unit (1 s at 16 kHz) of pcm_f32le silence, matching the
-    # official full-duplex behavior where the microphone keeps streaming
-    # silence while the assistant speaks; replies span multiple units.
+    # One MiniCPM model unit (1 s at 16 kHz) is the compatibility default.
+    # Other native-duplex adapters may use a different frame-locked unit.
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
 
     def _native_silence_unit_payload(self) -> dict[str, object]:
+        samples = int(getattr(self._serving_runtime_adapter, "silence_continuation_samples", 16000))
+        audio = (
+            self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO
+            if samples == 16000
+            else base64.b64encode(bytes(samples * 4)).decode("ascii")
+        )
         return {
             "type": "audio",
-            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
+            "audio": audio,
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
         }
