@@ -178,7 +178,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                 timeout_s=args.timeout_s,
                 label="model output",
             )
-        except BaseException:
+        except (Exception, asyncio.CancelledError):
             (output_dir / "events.failed.jsonl").write_text(
                 "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in client.events.events),
                 encoding="utf-8",

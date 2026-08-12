@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 import numpy as np
+import torch
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
@@ -59,22 +60,22 @@ class _RequestState:
 def _coerce_ints(value: object) -> list[int]:
     if value is None:
         return []
-    if hasattr(value, "detach"):
-        try:
-            value = value.detach().cpu().reshape(-1).tolist()
-        except Exception:
-            return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, np.ndarray):
+        value = value.reshape(-1).tolist()
     if isinstance(value, int):
         return [value]
     if not isinstance(value, list | tuple):
         return []
     values: list[int] = []
     for item in value:
-        if hasattr(item, "item"):
-            try:
-                item = item.item()
-            except Exception:
+        if isinstance(item, torch.Tensor):
+            if item.numel() != 1:
                 continue
+            item = item.item()
+        elif isinstance(item, np.generic):
+            item = item.item()
         try:
             values.append(int(item))
         except (TypeError, ValueError):
@@ -130,16 +131,11 @@ def _sample_rate(metadata: Mapping[str, object]) -> int:
 def _audio_samples(audio: object | None) -> int:
     if audio is None:
         return 0
-    try:
-        import torch
-
-        if isinstance(audio, torch.Tensor):
-            return int(audio.numel())
-    except Exception:
-        pass
+    if isinstance(audio, torch.Tensor):
+        return int(audio.numel())
     try:
         return int(np.asarray(audio, dtype=np.float32).size)
-    except Exception:
+    except (TypeError, ValueError):
         return 0
 
 
