@@ -17,6 +17,7 @@ from vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter import
     NemotronVoiceChatServingRuntimeAdapter,
     _normalized_tools,
     _render_tool_prompt,
+    _require_native_full_duplex,
 )
 from vllm_omni.model_executor.models.nemotron_voicechat.pipeline import (
     NEMOTRON_VOICECHAT_PIPELINE,
@@ -167,3 +168,59 @@ def test_serving_capabilities_report_native_80ms_append() -> None:
     assert capabilities.supports_core_resumable_request is True
     assert capabilities.supports_core_kv_lease is False
     assert capabilities.supports_multi_session is False
+
+
+def test_serving_rejects_deferred_manual_response_mode() -> None:
+    with pytest.raises(ValueError, match="auto_response"):
+        _require_native_full_duplex(SimpleNamespace(extra_body={"auto_response": False}))
+    _require_native_full_duplex(SimpleNamespace(extra_body={"auto_response": True}))
+
+
+@pytest.mark.asyncio
+async def test_prepare_runtime_reuses_serving_tokenizer_in_data_plane(monkeypatch) -> None:
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: {
+            "<bos>": 101,
+            "<eos>": 102,
+            "<pad>": 103,
+            "<SPECIAL_20>": 120,
+            "<SPECIAL_21>": 121,
+            "<SPECIAL_22>": 122,
+        }[token],
+        encode=lambda *_args, **_kwargs: [7, 8],
+    )
+
+    def from_pretrained(ref: str, **_kwargs):
+        assert ref == "configured-tokenizer"
+        return tokenizer
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", from_pretrained)
+    adapter = NemotronVoiceChatServingRuntimeAdapter(lambda *_: None)
+    config = SimpleNamespace(
+        extra_body={"auto_response": True},
+        instructions="hello",
+    )
+    model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            stt_cfg={
+                "pretrained_llm": "configured-tokenizer",
+                "bos_token": "<bos>",
+                "eos_token": "<eos>",
+                "pad_token": "<pad>",
+            }
+        )
+    )
+
+    runtime = await adapter.prepare_runtime_config(config, model_config=model_config)
+
+    assert runtime["nvc_text_bos_id"] == 101
+    assert runtime["nvc_text_eos_id"] == 102
+    assert runtime["nvc_text_pad_id"] == 103
+    assert adapter.data_plane._special_ids == {
+        "bos": 101,
+        "eos": 102,
+        "pad": 103,
+        "sotc": 120,
+        "eotc": 121,
+    }
+    assert adapter.data_plane._tokenizer is tokenizer

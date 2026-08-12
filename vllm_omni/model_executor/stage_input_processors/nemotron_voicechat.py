@@ -39,6 +39,7 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes", "codes.audio", 
 # stt pad_token. The thinker also reports it in its latent metadata, which
 # takes precedence when present.
 _DEFAULT_TEXT_PAD_ID = 12
+_STEP_TOKEN_SNAPSHOT_MISSING = object()
 
 
 def _info_get(info: Any, key: str) -> Any:
@@ -49,6 +50,12 @@ def _info_get(info: Any, key: str) -> Any:
         if isinstance(meta, dict):
             return meta.get(key)
     return None
+
+
+def _truthy_scalar(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return bool(value.reshape(-1)[0].item()) if value.numel() else False
+    return bool(value)
 
 
 def _request_info(request: Any) -> dict[str, Any]:
@@ -139,8 +146,9 @@ def thinker2talker_async_chunk(
     the payload self-contained. ``meta.num_processed_tokens`` carries the
     logical prompt length for the code2wav producer's prompt-region trim.
     """
-    del multimodal_output
-    generated_delta = [int(token_id) for token_id in (kwargs.pop("new_token_ids", ()) or ())]
+    step_snapshot = kwargs.pop("new_token_ids", _STEP_TOKEN_SNAPSHOT_MISSING)
+    has_step_snapshot = step_snapshot is not _STEP_TOKEN_SNAPSHOT_MISSING
+    generated_delta = [int(token_id) for token_id in ((step_snapshot or ()) if has_step_snapshot else ())]
     request_id = request.external_req_id
     request_info = _request_info(request)
     duplex_info = request_info.get("duplex") if isinstance(request_info, dict) else None
@@ -156,7 +164,7 @@ def thinker2talker_async_chunk(
             raise ValueError("Nemotron VoiceChat duplex stage transfer lacks nvc_prompt_token_ids")
         logical_prompt_len = len(runtime_prompt)
         previous = list(state.get("nvc_duplex_text_tokens", ())) if isinstance(state, dict) else []
-        if generated_delta:
+        if has_step_snapshot:
             generated = previous + generated_delta
         elif generated_now[: len(previous)] == previous and len(generated_now) > len(previous):
             generated = generated_now
@@ -213,12 +221,13 @@ def talker2code2wav_async_chunk(
     prefix-decode of the final stack. Chunk cadence comes from the connector
     config key ``codec_chunk_frames`` (default 13 frames ~= 1 s of audio).
     """
-    del kwargs
     request_id = request.external_req_id
+    del kwargs
     request_info = _request_info(request)
-    codec_streaming = (
-        _info_get(request_info, "codec_streaming") is True or _info_get(multimodal_output, "codec_streaming") is True
+    codec_streaming = _truthy_scalar(_info_get(request_info, "codec_streaming")) or _truthy_scalar(
+        _info_get(multimodal_output, "codec_streaming")
     )
+    state = transfer_manager.request_payload.get(request_id)
 
     codes = None
     if isinstance(multimodal_output, dict):
@@ -241,7 +250,6 @@ def talker2code2wav_async_chunk(
     # request-level additional_information is overwritten both by arriving
     # thinker chunks and by talker info updates, so it races. Cache the first
     # sighting in the transfer-manager state as a fallback.
-    state = transfer_manager.request_payload.get(request_id)
     prompt_len = _info_get(multimodal_output if isinstance(multimodal_output, dict) else None, "nvc_logical_prompt_len")
     if prompt_len is None and isinstance(multimodal_output, dict):
         prompt_len = multimodal_output.get("meta.nvc_logical_prompt_len")

@@ -13,16 +13,45 @@ from vllm_omni.experimental.fullduplex.nemotron_voicechat.data_plane import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _stage2_output(audio: np.ndarray) -> object:
-    completion = SimpleNamespace(multimodal_output={"model_outputs": [audio], "sr": [22050]})
+_RUNTIME = {
+    "nvc_text_bos_id": 0,
+    "nvc_text_eos_id": 1,
+    "nvc_text_pad_id": 12,
+    "nvc_function_sotc_id": 20,
+    "nvc_function_eotc_id": 21,
+    "nvc_tokenizer_ref": "test-tokenizer",
+}
+
+
+def _projector(encode_audio=lambda *_: None) -> NemotronVoiceChatDataPlaneSession:
+    projector = NemotronVoiceChatDataPlaneSession(encode_audio)
+    projector.configure_runtime(_RUNTIME, tokenizer=SimpleNamespace(decode=lambda *_args, **_kwargs: "text"))
+    return projector
+
+
+def _stage0_output(token_id: int) -> object:
+    completion = SimpleNamespace(multimodal_output={"nvc_text_token_ids": [token_id]})
     return SimpleNamespace(
-        stage_id=2,
+        stage_id=0,
         request_output=SimpleNamespace(request_id="req-0", outputs=[completion]),
     )
 
 
+def _stage2_output(audio: np.ndarray, *, finished: bool = False) -> object:
+    completion = SimpleNamespace(
+        multimodal_output={
+            "model_outputs": [audio],
+            "sr": [22050],
+        }
+    )
+    return SimpleNamespace(
+        stage_id=2,
+        request_output=SimpleNamespace(request_id="req-0", outputs=[completion], finished=finished),
+    )
+
+
 def test_codec_audio_projects_legacy_runtime_event() -> None:
-    projector = NemotronVoiceChatDataPlaneSession(lambda *_: "encoded-pcm")
+    projector = _projector(lambda *_: "encoded-pcm")
     context = NemotronVoiceChatDataPlaneContext(epoch=2, response_format="pcm16")
 
     events = list(projector.project_output(_stage2_output(np.ones(1764, dtype=np.float32)), context=context))
@@ -35,8 +64,7 @@ def test_codec_audio_projects_legacy_runtime_event() -> None:
 
 
 def test_function_channel_projects_completed_call_without_ending_speech() -> None:
-    projector = NemotronVoiceChatDataPlaneSession(lambda *_: None)
-    projector._special_ids = {"bos": 0, "eos": 1, "pad": 12, "sotc": 20, "eotc": 21}
+    projector = _projector()
     projector._decode = lambda token_ids: (
         '[{"name":"weather","arguments":{"city":"Shanghai"}}]' if token_ids == [99] else ""
     )
@@ -59,3 +87,112 @@ def test_function_channel_projects_completed_call_without_ending_speech() -> Non
     assert len(function) == 1
     assert function[0]["name"] == "weather"
     assert function[0]["arguments"] == '{"city":"Shanghai"}'
+
+
+@pytest.mark.parametrize("stage2_first", [False, True])
+def test_speech_end_joins_eos_and_stage2_completion_in_either_order(stage2_first: bool) -> None:
+    projector = _projector(lambda *_: "audio")
+    eos = _stage0_output(1)
+    final_audio = _stage2_output(np.ones(1764, dtype=np.float32), finished=True)
+
+    outputs = (final_audio, eos) if stage2_first else (eos, final_audio)
+    events = [event for output in outputs for event in projector.project_output(output)]
+
+    assert sum(event.get("end_of_turn") is True for event in events) == 1
+
+
+def test_empty_listen_segment_does_not_satisfy_later_speech_eos() -> None:
+    projector = _projector(lambda *_: None)
+
+    assert list(projector.project_output(_stage2_output(np.empty(0, dtype=np.float32), finished=True))) == []
+    assert list(projector.project_output(_stage0_output(1))) == []
+
+    speech = list(
+        projector.project_output(
+            _stage2_output(np.ones(1764, dtype=np.float32), finished=True),
+        )
+    )
+
+    assert sum(event.get("end_of_turn") is True for event in speech) == 1
+
+
+@pytest.mark.parametrize(
+    ("modalities", "expected_text", "expected_audio"),
+    [
+        (("text",), True, False),
+        (("audio",), False, True),
+    ],
+)
+def test_modalities_filter_payloads_but_preserve_state(
+    modalities: tuple[str, ...],
+    expected_text: bool,
+    expected_audio: bool,
+) -> None:
+    projector = _projector(lambda *_: "audio")
+    projector._decode = lambda _token_ids: "hello"
+    context = NemotronVoiceChatDataPlaneContext(modalities=modalities)
+
+    text_events = list(projector.project_output(_stage0_output(42), context=context))
+    audio_events = list(
+        projector.project_output(
+            _stage2_output(np.ones(1764, dtype=np.float32)),
+            context=context,
+        )
+    )
+
+    assert bool([event for event in text_events if event.get("text") == "hello"]) is expected_text
+    assert bool([event for event in audio_events if event.get("audio_data") == "audio"]) is expected_audio
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not-json",
+        '{"arguments":{}}',
+        '{"name":"weather","arguments":"not-json"}',
+        '[{"name":"weather","arguments":[]}]',
+    ],
+)
+def test_malformed_function_payload_is_never_reported_as_success(raw: str) -> None:
+    projector = _projector()
+    projector._decode = lambda _token_ids: raw
+    context = NemotronVoiceChatDataPlaneContext()
+
+    events = []
+    for function_token in (20, 99, 21):
+        completion = SimpleNamespace(
+            multimodal_output={
+                "nvc_text_token_ids": [12],
+                "nvc_function_token": [function_token],
+            }
+        )
+        output = SimpleNamespace(
+            stage_id=0,
+            request_output=SimpleNamespace(request_id="req-fc", outputs=[completion]),
+        )
+        events.extend(projector.project_output(output, context=context))
+
+    assert not [event for event in events if event.get("function_call") is True]
+    errors = [event for event in events if event.get("error_code") == "nemotron_function_call_parse_error"]
+    assert len(errors) == 1
+
+
+def test_function_channel_without_eotc_is_not_reported_as_success() -> None:
+    projector = _projector()
+    context = NemotronVoiceChatDataPlaneContext()
+
+    events = []
+    for text_token, function_token in ((12, 20), (1, 99)):
+        completion = SimpleNamespace(
+            multimodal_output={
+                "nvc_text_token_ids": [text_token],
+                "nvc_function_token": [function_token],
+            }
+        )
+        output = SimpleNamespace(
+            stage_id=0,
+            request_output=SimpleNamespace(request_id="req-fc", outputs=[completion]),
+        )
+        events.extend(projector.project_output(output, context=context))
+
+    assert not [event for event in events if event.get("function_call") is True]

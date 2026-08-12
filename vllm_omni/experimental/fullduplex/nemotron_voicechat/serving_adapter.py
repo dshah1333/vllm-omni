@@ -100,7 +100,20 @@ def _render_tool_prompt(instructions: str, tools: list[dict[str, object]]) -> st
     )
 
 
-def _tokenize_runtime(model_config: Any, instructions: str) -> dict[str, object]:
+def _require_native_full_duplex(config: object) -> None:
+    extra_body = getattr(config, "extra_body", None)
+    enabled = isinstance(extra_body, dict) and (
+        extra_body.get("auto_response") is True or extra_body.get("full_duplex") is True
+    )
+    if not enabled:
+        raise ServingRuntimeConfigError(
+            "Nemotron VoiceChat currently supports model-native full-duplex streaming only; "
+            "set extra_body.auto_response=true",
+            code="unsupported_nemotron_duplex_mode",
+        )
+
+
+def _tokenize_runtime(model_config: Any, instructions: str) -> tuple[dict[str, object], Any]:
     from transformers import AutoTokenizer
 
     stt_cfg = _stt_config(model_config)
@@ -110,13 +123,16 @@ def _tokenize_runtime(model_config: Any, instructions: str) -> dict[str, object]
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=False)
 
     def token(name: str, default: str) -> int:
-        return int(tokenizer.convert_tokens_to_ids(stt_cfg.get(name, default)))
+        value = tokenizer.convert_tokens_to_ids(stt_cfg.get(name, default))
+        if value is None:
+            raise ServingRuntimeConfigError(f"Nemotron VoiceChat tokenizer does not define {name}")
+        return int(value)
 
     bos_id = token("bos_token", "<s>")
     eos_id = token("eos_token", "</s>")
     pad_id = token("pad_token", "<SPECIAL_12>")
     prompt_ids = [bos_id] + list(tokenizer.encode(instructions, add_special_tokens=False)) + [eos_id]
-    return {
+    runtime = {
         "instructions": instructions,
         "nvc_prompt_token_ids": prompt_ids,
         "nvc_text_bos_id": bos_id,
@@ -127,6 +143,7 @@ def _tokenize_runtime(model_config: Any, instructions: str) -> dict[str, object]
         "nvc_function_eotr_id": int(tokenizer.convert_tokens_to_ids("<SPECIAL_22>")),
         "nvc_tokenizer_ref": str(tokenizer_ref),
     }
+    return runtime, tokenizer
 
 
 class NemotronVoiceChatServingRuntimeAdapter:
@@ -211,22 +228,23 @@ class NemotronVoiceChatServingRuntimeAdapter:
                 "Nemotron VoiceChat runtime configuration is server-owned: " + ", ".join(private)
             )
 
-    @classmethod
     async def prepare_runtime_config(
-        cls,
+        self,
         config: object,
         *,
         model_config: Any,
     ) -> dict[str, object]:
-        cls.validate_client_extra_body(getattr(config, "extra_body", None))
+        self.validate_client_extra_body(getattr(config, "extra_body", None))
+        _require_native_full_duplex(config)
         instructions = str(getattr(config, "instructions", None) or _DEFAULT_SYSTEM_PROMPT)
         tools, tools_signature = _normalized_tools(config)
         rendered_prompt = _render_tool_prompt(instructions, tools)
-        runtime = await asyncio.to_thread(_tokenize_runtime, model_config, rendered_prompt)
+        runtime, tokenizer = await asyncio.to_thread(_tokenize_runtime, model_config, rendered_prompt)
         # Keep raw session values for immutable-in-incarnation update checks;
         # only the rendered prompt token ids enter Stage-0 KV.
         runtime["instructions"] = instructions
         runtime["nvc_tools_signature"] = tools_signature
+        self.data_plane.configure_runtime(runtime, tokenizer=tokenizer)
         return runtime
 
     @staticmethod
@@ -235,6 +253,7 @@ class NemotronVoiceChatServingRuntimeAdapter:
         current: Mapping[str, object],
     ) -> dict[str, object]:
         NemotronVoiceChatServingRuntimeAdapter.validate_client_extra_body(getattr(config, "extra_body", None))
+        _require_native_full_duplex(config)
         runtime = deepcopy(dict(current))
         instructions = str(getattr(config, "instructions", None) or _DEFAULT_SYSTEM_PROMPT)
         _, tools_signature = _normalized_tools(config)

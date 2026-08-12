@@ -16,6 +16,14 @@ _SAMPLE_BYTES = 4
 _FRAME_BYTES = NEMOTRON_VOICECHAT_FRAME_SAMPLES * _SAMPLE_BYTES
 
 
+def _require_terminal_tail(buffered_bytes: int) -> None:
+    if buffered_bytes > _FRAME_BYTES:
+        raise ValueError(
+            "Nemotron VoiceChat manual/deferred commit cannot contain more than one 80 ms frame; "
+            "enable extra_body.auto_response for native full-duplex streaming"
+        )
+
+
 def decode_pcm_f32le(payload: object, *, exact_frame: bool = False) -> bytes:
     if not isinstance(payload, dict):
         raise ValueError("Nemotron VoiceChat duplex audio payload must be a mapping")
@@ -177,6 +185,7 @@ class NemotronVoiceChatPcmAppendBuffer:
     ) -> NemotronVoiceChatPcmAppendReservation:
         if chunk_period_ms != 80:
             raise ValueError("Nemotron VoiceChat native duplex chunk_period_ms must be 80")
+        _require_terminal_tail(len(self._buffer))
         if not self._buffer:
             reservation = NemotronVoiceChatPcmAppendReservation(
                 self,
@@ -199,6 +208,7 @@ class NemotronVoiceChatPcmAppendBuffer:
     def flush(self, *, chunk_period_ms: int) -> dict[str, object] | None:
         if chunk_period_ms != 80:
             raise ValueError("Nemotron VoiceChat native duplex chunk_period_ms must be 80")
+        _require_terminal_tail(len(self._buffer))
         if not self._buffer:
             return None
         raw = bytes(self._buffer)

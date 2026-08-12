@@ -81,6 +81,26 @@ def test_exact_boundary_commit_has_no_synthetic_audio() -> None:
     assert committed.byte_count == 0
 
 
+@pytest.mark.parametrize("operation", ["commit", "flush"])
+def test_deferred_multi_frame_tail_fails_explicitly(operation: str) -> None:
+    buffer = NemotronVoiceChatPcmAppendBuffer()
+    for index in range(3):
+        reservation = buffer.prepare_append(
+            _payload(np.zeros(640, dtype=np.float32)),
+            operation_id=f"packet-{index}",
+            chunk_period_ms=80,
+            allow_emit=False,
+        )
+        assert reservation is None
+
+    with pytest.raises(ValueError, match="auto_response"):
+        if operation == "commit":
+            buffer.prepare_commit(operation_id="commit", chunk_period_ms=80)
+        else:
+            buffer.flush(chunk_period_ms=80)
+    assert buffer.pending_byte_count == 3 * 640 * np.dtype(np.float32).itemsize
+
+
 def test_rejects_packets_larger_than_one_model_frame() -> None:
     buffer = NemotronVoiceChatPcmAppendBuffer()
     with pytest.raises(ValueError, match="at most 1280"):

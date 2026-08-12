@@ -254,6 +254,7 @@ def test_thinker2talker_native_duplex_uses_runner_payload_and_stays_resumable() 
     req.model_intermediate_buffer = {
         "duplex": {
             "data_plane": True,
+            "source_input_seq": 4,
             "runtime_config": {
                 "nvc_prompt_token_ids": [0, 41, 42, 1],
             },
@@ -262,7 +263,13 @@ def test_thinker2talker_native_duplex_uses_runner_payload_and_stays_resumable() 
 
     # Resumable cleanup clears request.output_token_ids before the connector
     # thread runs, so the immutable per-step snapshot is authoritative.
-    payload = thinker2talker_async_chunk(tm, {}, req, is_finished=True, new_token_ids=[7])
+    payload = thinker2talker_async_chunk(
+        tm,
+        {},
+        req,
+        is_finished=True,
+        new_token_ids=[7],
+    )
 
     assert payload.ids.all == [_PAD] * 4 + [7]
     # ids.prompt extends the parked downstream scheduler request by one wake.
@@ -271,6 +278,35 @@ def test_thinker2talker_native_duplex_uses_runner_payload_and_stays_resumable() 
     assert payload.meta.request_id == "req-0"
     # A Stage-0 segment boundary is not terminal for a native duplex session.
     assert not bool(payload.meta.finished)
+
+
+def test_thinker2talker_explicit_empty_token_snapshot_never_reads_live_request() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        thinker2talker_async_chunk,
+    )
+
+    tm = _fake_transfer_manager()
+    req = _streaming_request(prompt_len=1, generated=[999])
+    req.model_intermediate_buffer = {
+        "duplex": {
+            "data_plane": True,
+            "source_input_seq": 5,
+            "runtime_config": {"nvc_prompt_token_ids": [0, 1]},
+        }
+    }
+
+    # The per-step output snapshot is authoritative even if the live Request
+    # has already advanced to a later frame on the save thread.
+    payload = thinker2talker_async_chunk(
+        tm,
+        {},
+        req,
+        is_finished=True,
+        new_token_ids=(),
+    )
+
+    assert payload.ids.all == [_PAD, _PAD]
+    assert tm.request_payload["req-0"]["nvc_duplex_text_tokens"] == []
 
 
 def test_talker2code2wav_async_chunk_cadence_and_left_context() -> None:
@@ -313,6 +349,29 @@ def test_talker2code2wav_async_chunk_requires_prompt_len() -> None:
     req = _streaming_request(prompt_len=3, generated=[], info=None)
     with pytest.raises(ValueError, match="logical prompt length"):
         talker2code2wav_async_chunk(tm, {"codes": {"audio": torch.zeros(5, 31, dtype=torch.long)}}, req)
+
+
+def test_talker2code2wav_preserves_tensor_streaming_flag() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=1)
+    req = _streaming_request(prompt_len=1, generated=[], info={})
+    payload = talker2code2wav_async_chunk(
+        tm,
+        {
+            "codes": {"audio": torch.zeros((1, 31), dtype=torch.long)},
+            "meta": {
+                "codec_streaming": torch.tensor([True]),
+                "nvc_logical_prompt_len": torch.tensor([1]),
+            },
+        },
+        req,
+        is_finished=True,
+    )
+
+    assert payload.meta.codec_streaming is True
 
 
 # =========================
@@ -386,7 +445,7 @@ def _async_info(timeline: list[int], prompt_len: int, finished: bool, request_id
     }
 
 
-def test_talker_output_keeps_streaming_codec_identity_on_wire() -> None:
+def test_talker_output_keeps_streaming_codec_mode_on_wire() -> None:
     talker = _bare_talker()
     output = talker.make_omni_output(
         torch.zeros((1, talker._hidden)),

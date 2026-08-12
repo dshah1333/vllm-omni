@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import uuid4
 
 import numpy as np
@@ -40,6 +40,7 @@ class NemotronVoiceChatDataPlaneContext:
 @dataclass(slots=True)
 class _RequestState:
     pending_speech_end: bool = False
+    completed_speech_audio: bool = False
     function_active: bool = False
     function_tokens: list[int] = field(default_factory=list)
     function_call_id: str | None = None
@@ -125,6 +126,16 @@ def _audio_samples(audio: object | None) -> int:
         return 0
 
 
+def _speech_end_event(request_id: str) -> dict[str, object]:
+    return {
+        "stage_role": "tts",
+        "is_listen": False,
+        "data_plane_request_id": request_id,
+        "text": "",
+        "end_of_turn": True,
+    }
+
+
 class NemotronVoiceChatDataPlaneSession:
     """Join frame-locked text/function outputs with Stage-2 audio."""
 
@@ -132,7 +143,27 @@ class NemotronVoiceChatDataPlaneSession:
         self._encode_audio = encode_audio
         self._requests: dict[str, _RequestState] = {}
         self._tokenizer = None
+        self._tokenizer_ref: str | None = None
         self._special_ids: dict[str, int] | None = None
+
+    def configure_runtime(self, runtime_config: Mapping[str, object], *, tokenizer: Any | None = None) -> None:
+        """Install the serving-resolved tokenizer contract as the sole truth."""
+        try:
+            special_ids = {
+                "bos": int(runtime_config["nvc_text_bos_id"]),
+                "eos": int(runtime_config["nvc_text_eos_id"]),
+                "pad": int(runtime_config["nvc_text_pad_id"]),
+                "sotc": int(runtime_config["nvc_function_sotc_id"]),
+                "eotc": int(runtime_config["nvc_function_eotc_id"]),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Nemotron VoiceChat data plane requires resolved special-token ids") from exc
+        tokenizer_ref = runtime_config.get("nvc_tokenizer_ref")
+        if not isinstance(tokenizer_ref, str) or not tokenizer_ref:
+            raise ValueError("Nemotron VoiceChat data plane requires nvc_tokenizer_ref")
+        self._special_ids = special_ids
+        self._tokenizer_ref = tokenizer_ref
+        self._tokenizer = tokenizer
 
     def begin_request(self, request_id: str) -> None:
         self._requests.setdefault(request_id, _RequestState()).terminal = False
@@ -157,20 +188,14 @@ class NemotronVoiceChatDataPlaneSession:
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
-            ref = os.environ.get("NEMOTRON_VOICECHAT_LLM_PATH") or "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
-            self._tokenizer = AutoTokenizer.from_pretrained(ref, trust_remote_code=False)
+            if self._tokenizer_ref is None:
+                raise RuntimeError("Nemotron VoiceChat data plane was used before runtime configuration")
+            self._tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_ref, trust_remote_code=False)
         return self._tokenizer
 
     def _ids(self) -> dict[str, int]:
         if self._special_ids is None:
-            tok = self._load_tokenizer()
-            self._special_ids = {
-                "bos": int(tok.convert_tokens_to_ids("<s>")),
-                "eos": int(tok.convert_tokens_to_ids("</s>")),
-                "pad": int(tok.convert_tokens_to_ids("<SPECIAL_12>")),
-                "sotc": int(tok.convert_tokens_to_ids("<SPECIAL_20>")),
-                "eotc": int(tok.convert_tokens_to_ids("<SPECIAL_21>")),
-            }
+            raise RuntimeError("Nemotron VoiceChat data plane was used before runtime configuration")
         return self._special_ids
 
     def _decode(self, token_ids: list[int]) -> str:
@@ -205,9 +230,11 @@ class NemotronVoiceChatDataPlaneSession:
         request_id = str(request_id) if request_id is not None else ""
         state = self._requests.setdefault(request_id, _RequestState())
         metadata = _multimodal(outer, completion)
-        ids = self._ids()
-
+        modalities = {modality.lower() for modality in context.modalities}
+        wants_text = "text" in modalities
+        wants_audio = "audio" in modalities
         if stage_id == 0 or "nvc_text_token_ids" in metadata:
+            ids = self._ids()
             text_ids = _coerce_ints(metadata.get("nvc_text_token_ids"))
             if not text_ids and completion is not None:
                 text_ids = _coerce_ints(
@@ -215,7 +242,11 @@ class NemotronVoiceChatDataPlaneSession:
                 )
             for token_id in text_ids[-1:]:
                 if token_id == ids["eos"]:
-                    state.pending_speech_end = True
+                    if state.completed_speech_audio:
+                        state.completed_speech_audio = False
+                        yield _speech_end_event(request_id)
+                    else:
+                        state.pending_speech_end = True
                 elif token_id == ids["pad"]:
                     yield {
                         "stage_role": "llm",
@@ -225,7 +256,7 @@ class NemotronVoiceChatDataPlaneSession:
                         "data_plane_request_id": request_id,
                         "end_of_turn": False,
                     }
-                elif token_id != ids["bos"]:
+                elif token_id != ids["bos"] and wants_text:
                     text = self._decode([token_id])
                     if text:
                         yield {
@@ -248,9 +279,14 @@ class NemotronVoiceChatDataPlaneSession:
         audio = _audio_value(metadata)
         sample_rate = _sample_rate(metadata)
         sample_count = _audio_samples(audio)
-        encoded = self._encode_audio(audio, sample_rate, context.response_format, context.speed)
+        encoded = (
+            self._encode_audio(audio, sample_rate, context.response_format, context.speed)
+            if wants_audio and audio is not None
+            else None
+        )
         segment_finished = bool(getattr(output, "finished", False) or getattr(outer, "finished", False))
-        end_of_turn = state.pending_speech_end and segment_finished
+        speech_audio_finished = segment_finished and sample_count > 0
+        end_of_turn = speech_audio_finished and state.pending_speech_end
         if encoded:
             yield {
                 "stage_role": "tts",
@@ -265,15 +301,15 @@ class NemotronVoiceChatDataPlaneSession:
                 "end_of_turn": end_of_turn,
             }
         elif end_of_turn:
-            yield {
-                "stage_role": "tts",
-                "is_listen": False,
-                "data_plane_request_id": request_id,
-                "text": "",
-                "end_of_turn": True,
-            }
+            yield _speech_end_event(request_id)
         if end_of_turn:
             state.pending_speech_end = False
+        elif speech_audio_finished:
+            # Stage-2 audio and Stage-0 EOS are independently projected. Keep
+            # the speech completion as a latch so either arrival order closes
+            # exactly one response. Empty/listen segments must not satisfy a
+            # later EOS.
+            state.completed_speech_audio = True
 
     def _project_function_token(
         self,
@@ -292,13 +328,26 @@ class NemotronVoiceChatDataPlaneSession:
             state.function_active = False
             raw = self._decode(state.function_tokens)
             state.function_tokens.clear()
-            for call in self._parse_calls(raw):
+            try:
+                calls = self._parse_calls(raw)
+            except ValueError as exc:
+                state.function_call_id = None
+                yield {
+                    "stage_role": "function",
+                    "data_plane_request_id": request_id,
+                    "error_code": "nemotron_function_call_parse_error",
+                    "error": str(exc),
+                }
+                return
+            for index, call in enumerate(calls):
                 yield {
                     "stage_role": "function",
                     "data_plane_request_id": request_id,
                     "function_call": True,
-                    "call_id": state.function_call_id or f"call_{uuid4().hex}",
-                    "name": str(call.get("name") or "unknown"),
+                    "call_id": (
+                        state.function_call_id if index == 0 and state.function_call_id else f"call_{uuid4().hex}"
+                    ),
+                    "name": str(call["name"]),
                     "arguments": (
                         call.get("arguments")
                         if isinstance(call.get("arguments"), str)
@@ -319,11 +368,31 @@ class NemotronVoiceChatDataPlaneSession:
             text = text.split("</TOOLCALL>", 1)[0]
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
-            return [{"name": "unknown", "arguments": text}] if text else []
+        except json.JSONDecodeError as exc:
+            raise ValueError("Nemotron VoiceChat produced malformed function-call JSON") from exc
         if isinstance(parsed, dict):
             parsed = [parsed]
-        return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("Nemotron VoiceChat function-call payload must be a non-empty object or list")
+        calls: list[dict[str, object]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise ValueError("Nemotron VoiceChat function-call entries must be objects")
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Nemotron VoiceChat function-call entries require a non-empty name")
+            arguments = item.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    decoded_arguments = json.loads(arguments)
+                except json.JSONDecodeError as exc:
+                    raise ValueError("Nemotron VoiceChat function-call arguments contain malformed JSON") from exc
+                if not isinstance(decoded_arguments, dict):
+                    raise ValueError("Nemotron VoiceChat function-call arguments must encode a JSON object")
+            elif not isinstance(arguments, dict):
+                raise ValueError("Nemotron VoiceChat function-call arguments must be a JSON object")
+            calls.append({"name": name.strip(), "arguments": arguments})
+        return calls
 
 
 __all__ = [
