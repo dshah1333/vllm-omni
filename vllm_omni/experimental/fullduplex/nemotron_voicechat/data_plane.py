@@ -19,7 +19,6 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_resource_request_belongs_to_session,
 )
 from vllm_omni.experimental.fullduplex.output import (
-    get_duplex_output_context,
     get_duplex_output_decision,
 )
 
@@ -200,17 +199,6 @@ class NemotronVoiceChatDataPlaneSession:
         context: NemotronVoiceChatDataPlaneContext | None = None,
     ) -> Iterator[dict[str, object]]:
         context = context or NemotronVoiceChatDataPlaneContext()
-        output_context = get_duplex_output_context(output)
-        output_fence = getattr(getattr(output_context, "identity", None), "fence", None)
-        if output_fence is not None and output_fence.epoch != context.epoch:
-            logger.debug(
-                "Nemotron VoiceChat dropped stale output: output_epoch=%s active_epoch=%s stage=%s",
-                output_fence.epoch,
-                context.epoch,
-                getattr(output, "stage_id", None),
-            )
-            return
-
         outer = output
         output, completion, stage_id = _unwrap(output)
         request_id = getattr(output, "request_id", None) or getattr(outer, "request_id", None)
@@ -261,7 +249,7 @@ class NemotronVoiceChatDataPlaneSession:
         sample_rate = _sample_rate(metadata)
         sample_count = _audio_samples(audio)
         encoded = self._encode_audio(audio, sample_rate, context.response_format, context.speed)
-        segment_finished = bool(getattr(output_context, "segment_finished", False))
+        segment_finished = bool(getattr(output, "finished", False) or getattr(outer, "finished", False))
         end_of_turn = state.pending_speech_end and segment_finished
         if encoded:
             yield {
