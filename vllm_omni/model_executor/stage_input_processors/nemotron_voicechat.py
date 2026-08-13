@@ -28,6 +28,7 @@ from vllm_omni.data_entry_keys import (
     MetaStruct,
     OmniPayloadStruct,
 )
+from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 
 # Full-sequence tensors are re-shipped whole; the full-payload accumulator must
 # replace (not concatenate) them if the producer fires more than once. The AR
@@ -50,12 +51,6 @@ def _info_get(info: Any, key: str) -> Any:
         if isinstance(meta, dict):
             return meta.get(key)
     return None
-
-
-def _truthy_scalar(value: Any) -> bool:
-    if isinstance(value, torch.Tensor):
-        return bool(value.reshape(-1)[0].item()) if value.numel() else False
-    return bool(value)
 
 
 def _request_info(request: Any) -> dict[str, Any]:
@@ -224,7 +219,7 @@ def talker2code2wav_async_chunk(
     request_id = request.external_req_id
     del kwargs
     request_info = _request_info(request)
-    codec_streaming = _truthy_scalar(_info_get(request_info, "codec_streaming")) or _truthy_scalar(
+    codec_streaming = scalar_bool(_info_get(request_info, "codec_streaming")) or scalar_bool(
         _info_get(multimodal_output, "codec_streaming")
     )
     state = transfer_manager.request_payload.get(request_id)

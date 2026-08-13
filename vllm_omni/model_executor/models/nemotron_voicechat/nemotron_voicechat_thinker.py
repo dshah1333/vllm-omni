@@ -339,8 +339,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     ) -> SamplerOutput | None:
         del sampling_metadata
         rows = self._duplex_sampling_rows
-        if not rows or set(rows) != set(range(int(logits.shape[0]))):
+        if not rows:
             return None
+        expected_rows = set(range(int(logits.shape[0])))
+        if set(rows) != expected_rows:
+            raise RuntimeError(
+                "NemotronVoiceChat native-duplex sampling requires every active batch row "
+                "to be a duplex request; mixed duplex/non-duplex batches are unsupported."
+            )
         sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
         for row_idx, request_id in rows.items():
             self._duplex_previous_text_tokens[request_id] = int(sampled[row_idx].item())

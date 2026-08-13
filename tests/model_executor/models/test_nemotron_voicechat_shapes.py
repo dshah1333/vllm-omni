@@ -190,6 +190,19 @@ def test_postprocess_skips_intermediate_prefill_chunks(monkeypatch: pytest.Monke
     assert update["nvc_function_tokens"].numel() == 1
 
 
+def test_duplex_sampler_rejects_mixed_batches_explicitly() -> None:
+    import torch
+
+    thinker = _bare_thinker()
+    thinker._duplex_sampling_rows = {0: "req-duplex"}
+    thinker._duplex_previous_text_tokens = {}
+
+    with pytest.raises(RuntimeError, match="mixed duplex/non-duplex batches are unsupported"):
+        thinker.sample(torch.zeros((2, 16)), None)
+
+    assert thinker._duplex_previous_text_tokens == {}
+
+
 def test_prefill_contract_arithmetic() -> None:
     # vllm_prefill_len = logical_prompt_token_len + 1 (the +1 is acoustic
     # frame 0); decode steps == acoustic_frame_count; NeMo timeline

@@ -46,6 +46,7 @@ from vllm.logger import init_logger
 from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import (
     merge_runtime_info,
     require_request_id,
+    scalar_bool,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -181,9 +182,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             streaming = meta.get("codec_streaming") if isinstance(meta, dict) else None
             if streaming is None:
                 streaming = info.get("meta.codec_streaming")
-            if hasattr(streaming, "item"):
-                streaming = streaming.item()
-            codec_streaming = codec_streaming or streaming is True
+            codec_streaming = codec_streaming or scalar_bool(streaming)
         if not codes_list:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
         codes = torch.cat(codes_list, dim=0)
@@ -301,9 +300,8 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 "prompt-region codes without it."
             )
         meta = info.get("meta")
-        codec_streaming = bool(
-            (isinstance(meta, dict) and meta.get("codec_streaming") is True) or info.get("meta.codec_streaming") is True
-        )
+        codec_streaming = scalar_bool(meta.get("codec_streaming")) if isinstance(meta, dict) else False
+        codec_streaming = codec_streaming or scalar_bool(info.get("meta.codec_streaming"))
         codec_request_id = meta.get("request_id") if isinstance(meta, dict) else None
         session = {
             "timeline": timeline,

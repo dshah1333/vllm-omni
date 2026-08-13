@@ -131,6 +131,17 @@ def test_validate_code_stack_negatives() -> None:
         validate_code_stack(bad, 31, 1024)
 
 
+def test_scalar_bool_normalizes_tensor_metadata() -> None:
+    from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
+
+    assert scalar_bool(True)
+    assert scalar_bool(torch.tensor(True))
+    assert scalar_bool(torch.tensor([True]))
+    assert not scalar_bool(torch.empty(0, dtype=torch.bool))
+    with pytest.raises(ValueError, match="scalar boolean metadata"):
+        scalar_bool(torch.tensor([True, False]))
+
+
 def test_tokenizer_resolution_failure_is_actionable(monkeypatch) -> None:
     from transformers import AutoConfig
 
@@ -464,6 +475,57 @@ def test_talker_output_keeps_streaming_codec_mode_on_wire() -> None:
     meta = output.multimodal_outputs["meta"]
     assert meta["nvc_logical_prompt_len"].item() == 3
     assert meta["codec_streaming"].item() is True
+
+
+def test_talker_init_session_accepts_tensor_streaming_flag() -> None:
+    talker = _bare_talker()
+    info = _async_info([12, 7], prompt_len=1, finished=False)
+    info["additional_information"]["meta"]["codec_streaming"] = torch.tensor([True])
+
+    talker.preprocess(torch.zeros(1, dtype=torch.long), None, _omni_is_prefill=True, **info)
+
+    assert talker._sessions["req-0"]["codec_streaming"] is True
+
+
+def test_code2wav_accepts_tensor_streaming_flag() -> None:
+    from torch import nn
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_code2wav import (
+        NemotronVoiceChatCode2Wav,
+    )
+
+    class _FakeCodec(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = nn.Parameter(torch.zeros(1))
+            self.cache = None
+
+        def decode(self, codes, lens, cache=None):
+            del codes, lens
+            self.cache = cache
+            return torch.zeros((1, 4)), torch.tensor([4])
+
+    model = NemotronVoiceChatCode2Wav.__new__(NemotronVoiceChatCode2Wav)
+    nn.Module.__init__(model)
+    model._sample_rate = 22050
+    model._num_quantizers = 31
+    model._codebook_size = 1024
+    model._wav_per_frame = 1764
+    model._duplex_codec_caches = {}
+    model.audio_codec = _FakeCodec()
+
+    output = model.forward(
+        runtime_additional_information=[
+            {
+                "codes": {"audio": torch.zeros((1, 31), dtype=torch.long)},
+                "meta": {"codec_streaming": torch.tensor([True]), "request_id": "req-codec"},
+            }
+        ]
+    )
+
+    assert "req-codec" in model._duplex_codec_caches
+    assert model.audio_codec.cache is model._duplex_codec_caches["req-codec"]
+    assert output.multimodal_outputs["model_outputs"][0].shape == (4,)
 
 
 def test_talker_drains_all_received_positions_per_wake() -> None:

@@ -24,6 +24,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.models.nemotron_voicechat.runtime_info import scalar_bool
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
@@ -148,10 +149,9 @@ class NemotronVoiceChatCode2Wav(nn.Module):
             meta = runtime_info.get("meta") if isinstance(runtime_info, Mapping) else None
             if isinstance(meta, Mapping) and meta.get("nemotron_voicechat_dummy_profile") is True:
                 continue
-            codec_streaming = bool(
-                (isinstance(meta, Mapping) and meta.get("codec_streaming") is True)
-                or (isinstance(runtime_info, Mapping) and runtime_info.get("meta.codec_streaming") is True)
-            )
+            codec_streaming = scalar_bool(meta.get("codec_streaming")) if isinstance(meta, Mapping) else False
+            if isinstance(runtime_info, Mapping):
+                codec_streaming = codec_streaming or scalar_bool(runtime_info.get("meta.codec_streaming"))
             cache_request_id = meta.get("request_id") if isinstance(meta, Mapping) else None
             if cache_request_id is None and isinstance(runtime_info, Mapping):
                 cache_request_id = runtime_info.get("meta.request_id")
