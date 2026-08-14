@@ -11,9 +11,10 @@ loop), so the prompt slots are reconstructed here, and the timeline metadata
 rides ``additional_information``.
 
 talker (1) -> code2wav (2): PersonaPlex-style full payload. The talker
-accumulates one 31-quantizer code stack per frame under ``("codes","audio")``;
-the producer ships the prompt-trimmed ``[frames, 31]`` stack once the request
-finishes, and the sync placeholder builder sizes stage-2's dummy prompt.
+accumulates one 31-quantizer code stack per frame under ``("codes","audio")``.
+The synchronous producer ships the prompt-trimmed ``[frames, 31]`` stack once
+the request finishes.  Native duplex wakes expose that same cumulative stack,
+so the streaming producer must delta it before feeding code2wav's causal cache.
 """
 
 from __future__ import annotations
@@ -206,15 +207,14 @@ def talker2code2wav_async_chunk(
     is_finished: bool = False,
     **kwargs: Any,
 ) -> OmniPayloadStruct | None:
-    """Streaming producer: ship prompt-trimmed CUMULATIVE code stacks in chunks.
+    """Streaming producer: ship prompt-trimmed code stacks in chunks.
 
-    Follows the NeMo incremental-decode recipe (``decode_one_audio_step``):
-    each chunk carries the FULL trimmed code history and
-    ``meta.left_context_size`` = frames the codec already emitted, so the
-    code2wav stage re-decodes the whole prefix and slices off only the new
-    samples — no seams, no crossfade, and the concatenated stream equals the
-    prefix-decode of the final stack. Chunk cadence comes from the connector
-    config key ``codec_chunk_frames`` (default 13 frames ~= 1 s of audio).
+    The regular path follows NeMo's prefix-decode recipe: each chunk carries
+    the full trimmed history and ``meta.left_context_size`` identifies frames
+    already emitted. Native duplex talker wakes also carry cumulative history,
+    but code2wav keeps causal codec state for that path and therefore must see
+    only rows not observed on an earlier wake. Chunk cadence comes from
+    ``codec_chunk_frames`` (default 13 frames ~= 1 s of audio).
     """
     request_id = request.external_req_id
     del kwargs
@@ -223,6 +223,14 @@ def talker2code2wav_async_chunk(
         _info_get(multimodal_output, "codec_streaming")
     )
     state = transfer_manager.request_payload.get(request_id)
+    if isinstance(state, dict):
+        codec_streaming = codec_streaming or bool(state.get("nvc_codec_stream_started", False))
+    # ``is_finished`` describes the current resumable Stage-1 scheduler
+    # segment, not the lifetime of a native-duplex codec stream. Marking each
+    # segment terminal makes the connector clean sender state after its first
+    # chunk; every later one-row wake is then mistaken for a fresh stream and
+    # trimmed as prompt context. Duplex lifetime is closed by session abort.
+    stream_finished = bool(is_finished and not codec_streaming)
 
     codes = None
     if isinstance(multimodal_output, dict):
@@ -231,7 +239,14 @@ def talker2code2wav_async_chunk(
         if codes is None:
             codes = multimodal_output.get("codes.audio")
     if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
-        if not is_finished:
+        if not stream_finished:
+            # Returning ``None`` at a resumable segment boundary makes the
+            # generic chunk adapter synthesize ``is_segment_finished=True``.
+            # Stage 2 then stops polling after the first 80 ms wake.  An
+            # explicit non-terminal empty payload consumes this connector
+            # sequence number without closing the long-lived codec stream.
+            if codec_streaming:
+                return _empty_streaming_payload(request_id=request_id)
             return None
         return _empty_finished_payload(
             codec_streaming=codec_streaming,
@@ -261,22 +276,58 @@ def talker2code2wav_async_chunk(
             "trim the prompt-region codes for streaming code2wav."
         )
     frames_sent = int(state.get("nvc_frames_sent", 0)) if isinstance(state, dict) else 0
-    if codec_streaming and frames_sent > 0:
-        # The duplex talker emits only rows produced by this wake.
-        trimmed = codes
+    if codec_streaming:
+        # The AR runner exposes its cumulative model_intermediate_buffer on
+        # every wake. Feeding that whole prefix into a stateful causal codec
+        # replays history into its cache (live traces showed lengths
+        # 19,20,20,21,21,...) and corrupts the waveform. Track rows OBSERVED,
+        # separately from rows EMITTED at the chunk cadence, and ship only the
+        # suffix first seen on this wake.
+        full_trimmed = codes[max(int(prompt_len) - 1, 0) :].detach().to(dtype=torch.long, device="cpu")
+        frames_seen = int(state.get("nvc_frames_seen", 0)) if isinstance(state, dict) else 0
+        if int(full_trimmed.shape[0]) < frames_seen:
+            raise ValueError(
+                "NemotronVoiceChat duplex talker code history shrank from "
+                f"{frames_seen} to {int(full_trimmed.shape[0])} frames; cannot "
+                "safely continue the stateful code2wav stream."
+            )
+        trimmed = full_trimmed[frames_seen:]
+        frames_seen = int(full_trimmed.shape[0])
+        pending = state.get("nvc_pending_codes") if isinstance(state, dict) else None
+        if isinstance(pending, torch.Tensor) and pending.numel() > 0:
+            trimmed = torch.cat([pending.reshape(-1, codes.shape[-1]), trimmed], dim=0)
+        new_frames = int(trimmed.shape[0])
     else:
         trimmed = codes[max(int(prompt_len) - 1, 0) :]
-    new_frames = int(trimmed.shape[0]) if codec_streaming else int(trimmed.shape[0]) - frames_sent
-    if new_frames <= 0 and not is_finished:
+        new_frames = int(trimmed.shape[0]) - frames_sent
+    if new_frames <= 0 and not stream_finished:
+        if codec_streaming:
+            transfer_manager.request_payload[request_id] = {
+                "nvc_frames_sent": frames_sent,
+                "nvc_frames_seen": frames_seen,
+                "nvc_prompt_len": int(prompt_len),
+                "nvc_codec_stream_started": True,
+                "nvc_pending_codes": trimmed,
+            }
+            return _empty_streaming_payload(request_id=request_id)
         return None
 
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_frames = int(cfg.get("codec_chunk_frames", 13))
-    if new_frames < chunk_frames and not is_finished:
+    if new_frames < chunk_frames and not stream_finished:
+        if codec_streaming:
+            transfer_manager.request_payload[request_id] = {
+                "nvc_frames_sent": frames_sent,
+                "nvc_frames_seen": frames_seen,
+                "nvc_prompt_len": int(prompt_len),
+                "nvc_codec_stream_started": True,
+                "nvc_pending_codes": trimmed,
+            }
+            return _empty_streaming_payload(request_id=request_id)
         return None
-    if new_frames <= 0 and is_finished and frames_sent > 0:
+    if new_frames <= 0 and stream_finished and frames_sent > 0:
         # Everything already shipped; emit a terminal empty chunk so the
         # code2wav request observes meta.finished.
         return _empty_finished_payload(
@@ -286,7 +337,9 @@ def talker2code2wav_async_chunk(
 
     transfer_manager.request_payload[request_id] = {
         "nvc_frames_sent": frames_sent + new_frames if codec_streaming else int(trimmed.shape[0]),
+        **({"nvc_frames_seen": frames_seen} if codec_streaming else {}),
         "nvc_prompt_len": int(prompt_len),
+        "nvc_codec_stream_started": codec_streaming,
     }
     code_payload = trimmed
     return OmniPayloadStruct(
@@ -295,7 +348,24 @@ def talker2code2wav_async_chunk(
             left_context_size=0 if codec_streaming else frames_sent,
             codec_streaming=codec_streaming,
             request_id=request_id if codec_streaming else None,
-            finished=torch.tensor(bool(is_finished), dtype=torch.bool),
+            finished=torch.tensor(stream_finished, dtype=torch.bool),
+            # Native duplex scheduler segments are transport wakes, not codec
+            # stream boundaries.  Preserve polling across successive wakes.
+            is_segment_finished=(
+                torch.tensor(False, dtype=torch.bool) if codec_streaming else None
+            ),
+        ),
+    )
+
+
+def _empty_streaming_payload(*, request_id: str) -> OmniPayloadStruct:
+    return OmniPayloadStruct(
+        codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
+        meta=MetaStruct(
+            codec_streaming=True,
+            request_id=request_id,
+            finished=torch.tensor(False, dtype=torch.bool),
+            is_segment_finished=torch.tensor(False, dtype=torch.bool),
         ),
     )
 

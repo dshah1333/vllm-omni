@@ -101,6 +101,19 @@ def test_speech_end_joins_eos_and_stage2_completion_in_either_order(stage2_first
     assert sum(event.get("end_of_turn") is True for event in events) == 1
 
 
+def test_streaming_audio_chunk_advances_eos_join_without_finishing_request() -> None:
+    projector = _projector(lambda *_: "audio")
+
+    assert list(projector.project_output(_stage0_output(1))) == []
+    events = list(
+        projector.project_output(
+            _stage2_output(np.ones(1764, dtype=np.float32), finished=False),
+        )
+    )
+
+    assert sum(event.get("end_of_turn") is True for event in events) == 1
+
+
 def test_empty_listen_segment_does_not_satisfy_later_speech_eos() -> None:
     projector = _projector(lambda *_: None)
 
@@ -114,6 +127,35 @@ def test_empty_listen_segment_does_not_satisfy_later_speech_eos() -> None:
     )
 
     assert sum(event.get("end_of_turn") is True for event in speech) == 1
+
+
+def test_previous_audio_frame_does_not_satisfy_later_text_eos() -> None:
+    projector = _projector(lambda *_: "audio")
+    projector._decode = lambda _token_ids: "hello"
+
+    assert not [
+        event
+        for event in projector.project_output(_stage0_output(42))
+        if event.get("end_of_turn") is True
+    ]
+    first_audio = list(
+        projector.project_output(
+            _stage2_output(np.ones(1764, dtype=np.float32), finished=True),
+        )
+    )
+    assert not [event for event in first_audio if event.get("end_of_turn") is True]
+
+    # The old boolean latch closed here because *some* earlier Stage-2 chunk
+    # had finished.  EOS is text frame 2, so it must wait for audio frame 2.
+    eos = list(projector.project_output(_stage0_output(1)))
+    assert not [event for event in eos if event.get("end_of_turn") is True]
+
+    second_audio = list(
+        projector.project_output(
+            _stage2_output(np.ones(1764, dtype=np.float32), finished=True),
+        )
+    )
+    assert sum(event.get("end_of_turn") is True for event in second_audio) == 1
 
 
 @pytest.mark.parametrize(

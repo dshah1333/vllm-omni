@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import yaml
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine.contracts import DuplexInputMode
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
@@ -115,6 +115,8 @@ def test_runtime_forces_greedy_single_token_thinker() -> None:
     assert configured[0].temperature == 0.0
     assert configured[0].max_tokens == 1
     assert configured[0].ignore_eos is True
+    assert all(params.output_kind == RequestOutputKind.DELTA for params in configured)
+    assert all(configured[index] is not defaults[index] for index in range(len(defaults)))
 
 
 def test_stage0_token_is_a_direct_duplex_side_channel() -> None:

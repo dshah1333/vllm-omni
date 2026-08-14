@@ -21,6 +21,7 @@ import json
 import math
 import os
 from dataclasses import dataclass, fields
+from functools import lru_cache
 from typing import Any
 
 import torch
@@ -284,6 +285,29 @@ def get_masking_rate(rate: Tensor, exponent: float = 3.0) -> Tensor:
 get_rate = get_masking_rate
 
 
+@lru_cache(maxsize=32)
+def get_unmask_counts(num_iter: int, exponent: float, num_quantizers: int) -> tuple[int, ...]:
+    """Return the fixed per-iteration RVQ unmask schedule on the host.
+
+    ``generate_step`` used to rebuild this schedule on the GPU for every
+    acoustic frame, branch on a device scalar at all 8 iterations, and call
+    ``.item()`` twice at each of its 5 non-empty iterations.  That forced 18
+    scalar device synchronizations for every 80 ms of output even though the
+    schedule depends only on immutable generation settings.  Computing it once
+    on the CPU preserves the original float32 torch arithmetic while making
+    every loop bound an ordinary Python int.
+    """
+    if num_iter <= 0:
+        raise ValueError(f"num_iter must be positive, got {num_iter}")
+    if num_quantizers <= 0:
+        raise ValueError(f"num_quantizers must be positive, got {num_quantizers}")
+    rates = torch.linspace(0.0, 1.0, num_iter + 1)[:-1].unsqueeze(-1)
+    masking_rates = get_masking_rate(rates, exponent=exponent)
+    num_maskings = torch.ceil(masking_rates * num_quantizers).long()
+    counts = num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])
+    return tuple(int(count) for count in counts.flatten().tolist())
+
+
 def get_mask(
     code_mask: Tensor,
     num_masking: Tensor,
@@ -475,6 +499,7 @@ def build_vocabs(
 @torch._dynamo.disable
 def depthsum_encoding_step(
     embs: Tensor,
+    embs_squared_norm: Tensor,
     r: Tensor,
     code: Tensor,
     depth_str: int = 0,
@@ -482,7 +507,7 @@ def depthsum_encoding_step(
 ) -> Tensor:
     for i in range(depth_str, depth_str + k):
         idx_sel = (
-            embs[i].pow(2).sum(-1)  # [g?, v]
+            embs_squared_norm[i]  # [g?, v]
             - 2
             * (r.unsqueeze(-2) @ embs[i].transpose(-1, -2)).squeeze(-2)  # [b, ?, g?, h] , [g?, h, v] -> [b, ?, g?, v]
         ).argmin(-1)
@@ -493,6 +518,22 @@ def depthsum_encoding_step(
         code[..., i] = idx_sel
 
     return code
+
+
+def update_depthsum_embedding(
+    code_latent: Tensor,
+    code: Tensor,
+    rvq_embs: Tensor,
+    depth_start: int,
+    k: int,
+) -> Tensor:
+    """Incrementally add newly unmasked RVQ embeddings in reference order."""
+    for quantizer_idx in range(depth_start, depth_start + k):
+        code_latent = code_latent + F.embedding(
+            code[..., quantizer_idx],
+            rvq_embs[quantizer_idx],
+        )
+    return code_latent
 
 
 class MoGHead(nn.Module):
@@ -1079,7 +1120,16 @@ class RVQEARTTSModel(nn.Module):
         )
 
     def set_rvq_embs(self, rvq_embs: Tensor):
-        self.register_buffer("rvq_embs", rvq_embs.detach().clone())
+        rvq_embs = rvq_embs.detach().clone()
+        self.register_buffer("rvq_embs", rvq_embs)
+        # Constant term in every residual nearest-neighbour lookup.  Computing
+        # it once removes 31 codebook-wide square/reduction kernels from every
+        # generated 80 ms acoustic frame without changing the search order.
+        self.register_buffer(
+            "rvq_embs_squared_norm",
+            rvq_embs.pow(2).sum(-1),
+            persistent=False,
+        )
 
     def depthsum_embedding(self, code: Tensor) -> Tensor:
         """
@@ -1572,18 +1622,26 @@ class RVQEARTTSModel(nn.Module):
 
         # Initialize the full code tensor
         code = torch.zeros((b, t, d), dtype=torch.long, device=device) + self.config.codebook_size
+        # All entries initially point at the padded (zero) RVQ row.  Keep the
+        # depth-summed latent incrementally as codebooks are unmasked instead
+        # of looking up all ``d`` codebooks again on every MoG iteration.
+        # The per-codebook loop deliberately preserves the original summation
+        # order, and therefore its fp32 inference numerics.
+        code_latent = torch.zeros(
+            (b, t, self.rvq_embs.shape[-1]),
+            dtype=torch.float32,
+            device=device,
+        )
 
-        # 3. Set up the iterative denoising schedule for the continuous part
-        rates = torch.linspace(0.0, 1.0, num_iter + 1, device=device)[:-1].unsqueeze(-1)
-        masking_rates = get_masking_rate(rates, exponent=exponent)
-        num_maskings = torch.ceil(masking_rates * self.config.num_quantizers).long()
-
-        ks = num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])
+        # 3. Set up the iterative denoising schedule for the continuous part.
+        # It is invariant across frames, so keep it cached on the host instead
+        # of allocating GPU tensors and synchronizing through ``.item()``.
+        unmask_counts = get_unmask_counts(num_iter, float(exponent), d)
 
         # 4. Iteratively unmask the continuous part of the code
         cnt = 0
-        for i, k in enumerate(ks):
-            if torch.all(k == 0):
+        for i, k in enumerate(unmask_counts):
+            if k == 0:
                 continue
 
             # Prepare input for the MoG head
@@ -1591,9 +1649,11 @@ class RVQEARTTSModel(nn.Module):
             top_p_or_k_i = top_p_or_k[i] if top_p_or_k is not None else 1.0
             noise_scale_i = noise_scale[i] if noise_scale is not None else 1.0
 
-            mog_input_embeds = self.embed_code(self.depthsum_embedding(code))
+            mog_input_embeds = self.embed_code(
+                code_latent.to(self.embed_code.weight.dtype)
+            )
             if self.config.random_target_masking:
-                mog_input_embeds += self.embed_target_mask(cnt + k - 1)
+                mog_input_embeds += self.embed_target_mask.weight[cnt + k - 1]
             if guidance_scale_i > 0.0:
                 mog_input_embeds = torch.cat(
                     [mog_input_embeds + hidden_states, mog_input_embeds + uncond_hidden_states], 0
@@ -1607,8 +1667,25 @@ class RVQEARTTSModel(nn.Module):
                 top_p_or_k=top_p_or_k_i,
             )
             z = mog_mu + torch.exp(mog_logs) * torch.randn_like(mog_mu) * noise_scale_i
-            code = depthsum_encoding_step(self.rvq_embs, z, code, cnt, k[0].item())
-            cnt += k[0].item()
+            code = depthsum_encoding_step(
+                self.rvq_embs,
+                self.rvq_embs_squared_norm,
+                z,
+                code,
+                cnt,
+                k,
+            )
+            # The latent is only consumed by a later MoG iteration; the final
+            # 22-codebook group does not need to be embedded at all.
+            if cnt + k < d:
+                code_latent = update_depthsum_embedding(
+                    code_latent,
+                    code,
+                    self.rvq_embs,
+                    cnt,
+                    k,
+                )
+            cnt += k
         return code, lm_logits, eos_flag
 
     def load_state_dict(self, state_dict, strict: bool = True):

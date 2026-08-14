@@ -19,6 +19,46 @@ from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_think
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
+
+def test_streaming_mel_slice_matches_nemo_cache_geometry() -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemotron_voicechat_thinker import (
+        slice_perception_streaming_mel,
+    )
+
+    cfg = SimpleNamespace(
+        chunk_size=[1, 8],
+        shift_size=[1, 8],
+        pre_encode_cache_size=[0, 9],
+        drop_extra_pre_encoded=2,
+    )
+    first, first_drop = slice_perception_streaming_mel(
+        torch.arange(9).reshape(1, 1, 9),
+        0,
+        cfg,
+    )
+    assert first.flatten().tolist() == [0]
+    assert first_drop == 0
+
+    second, second_drop = slice_perception_streaming_mel(
+        torch.arange(17).reshape(1, 1, 17),
+        1,
+        cfg,
+    )
+    assert second.shape[-1] == 17
+    assert second.flatten().tolist() == [0] * 9 + list(range(1, 9))
+    assert second_drop == 2
+
+    third, _ = slice_perception_streaming_mel(
+        torch.arange(25).reshape(1, 1, 25),
+        2,
+        cfg,
+    )
+    assert third.flatten().tolist() == list(range(17))
+
 # Perception config subset matching the checkpoint (mel 10 ms hop, n_fft 512,
 # dw-striding 8x CAUSAL subsampling, conv kernel 3). causal_downsampling is
 # what the real checkpoint sets; omitting it here is exactly what let the
@@ -217,6 +257,150 @@ def test_prefill_contract_arithmetic() -> None:
     talker_rows = (logical_prompt_len + frames) - 1
     trimmed = talker_rows - (logical_prompt_len - 1)
     assert trimmed == frames
+
+
+@pytest.mark.parametrize(
+    ("num_iter", "exponent", "num_quantizers"),
+    [
+        (1, 3.0, 31),
+        (4, 1.0, 8),
+        (8, 2.0, 31),
+        (8, 3.0, 31),  # shipped VoiceChat generation settings
+        (16, 4.0, 64),
+    ],
+)
+def test_cached_unmask_counts_match_original_gpu_schedule(
+    num_iter: int,
+    exponent: float,
+    num_quantizers: int,
+) -> None:
+    import torch
+    from torch.nn import functional as F
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
+        get_masking_rate,
+        get_unmask_counts,
+    )
+
+    # This is the original per-frame schedule construction, kept here as the
+    # executable contract for the cached host-side implementation.
+    rates = torch.linspace(0.0, 1.0, num_iter + 1)[:-1].unsqueeze(-1)
+    num_maskings = torch.ceil(get_masking_rate(rates, exponent) * num_quantizers).long()
+    expected = num_maskings - F.pad(num_maskings[1:], [0, 0, 0, 1])
+
+    actual = get_unmask_counts(num_iter, exponent, num_quantizers)
+    assert actual == tuple(expected.flatten().tolist())
+    assert sum(actual) == num_quantizers
+    assert get_unmask_counts(num_iter, exponent, num_quantizers) is actual
+
+
+def test_incremental_depthsum_is_bitwise_equal_to_full_recompute() -> None:
+    import torch
+    from torch.nn import functional as F
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
+        get_unmask_counts,
+        update_depthsum_embedding,
+    )
+
+    generator = torch.Generator().manual_seed(6089)
+    num_quantizers, codebook_size, latent_size = 31, 32, 16
+    rvq_embs = torch.randn(
+        num_quantizers,
+        codebook_size,
+        latent_size,
+        generator=generator,
+    )
+    code = torch.full((2, 1, num_quantizers), codebook_size, dtype=torch.long)
+    incremental = torch.zeros((2, 1, latent_size), dtype=torch.float32)
+    padded = F.pad(rvq_embs, (0, 0, 0, 1))
+
+    cnt = 0
+    for k in get_unmask_counts(8, 3.0, num_quantizers):
+        if k == 0:
+            continue
+        reference = torch.zeros_like(incremental)
+        for quantizer_idx in range(num_quantizers):
+            reference = reference + F.embedding(
+                code[..., quantizer_idx],
+                padded[quantizer_idx],
+            )
+        assert torch.equal(incremental, reference)
+
+        code[..., cnt : cnt + k] = torch.randint(
+            codebook_size,
+            (2, 1, k),
+            generator=generator,
+        )
+        if cnt + k < num_quantizers:
+            incremental = update_depthsum_embedding(
+                incremental,
+                code,
+                rvq_embs,
+                cnt,
+                k,
+            )
+        cnt += k
+
+    assert cnt == num_quantizers
+
+
+def test_precomputed_rvq_norm_preserves_residual_codes() -> None:
+    import torch
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
+        depthsum_encoding_step,
+    )
+
+    generator = torch.Generator().manual_seed(16080)
+    embs = torch.randn(5, 16, 8, generator=generator)
+    residual = torch.randn(2, 1, 8, generator=generator)
+    code = torch.full((2, 1, 5), 16, dtype=torch.long)
+    expected_norm = embs.pow(2).sum(-1)
+
+    actual = depthsum_encoding_step(
+        embs,
+        expected_norm,
+        residual.clone(),
+        code.clone(),
+        0,
+        5,
+    )
+
+    reference = code.clone()
+    running = residual.clone()
+    for quantizer_idx in range(5):
+        selected = (
+            embs[quantizer_idx].pow(2).sum(-1)
+            - 2
+            * (
+                running.unsqueeze(-2)
+                @ embs[quantizer_idx].transpose(-1, -2)
+            ).squeeze(-2)
+        ).argmin(-1)
+        running = running - torch.nn.functional.embedding(
+            selected,
+            embs[quantizer_idx],
+        )
+        reference[..., quantizer_idx] = selected
+
+    assert torch.equal(actual, reference)
+
+
+def test_precomputed_rvq_norm_is_not_a_checkpoint_weight() -> None:
+    import torch
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
+        RVQEARTTSModel,
+    )
+
+    module = torch.nn.Module()
+    rvq_embs = torch.randn(3, 8, 4)
+    RVQEARTTSModel.set_rvq_embs(module, rvq_embs)
+
+    assert "rvq_embs" in module.state_dict()
+    assert "rvq_embs_squared_norm" not in module.state_dict()
+    assert torch.equal(module.rvq_embs_squared_norm, rvq_embs.pow(2).sum(-1))
 
 
 def test_torchaudio_mel_filterbank_matches_librosa() -> None:

@@ -414,6 +414,29 @@ def test_send_single_request_respects_processor_receiver_boundary(build_adapter,
     assert sent_payload.meta.is_segment_finished.item() is False
 
 
+def test_send_single_request_respects_codec_stream_lifetime(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-codec-stream", RequestStatus.FINISHED_STOPPED, external_req_id="ext-codec-stream")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(
+            codec_streaming=True,
+            finished=torch.tensor(False, dtype=torch.bool),
+            is_segment_finished=torch.tensor(False, dtype=torch.bool),
+        )
+    )
+    cleanup_calls = []
+    monkeypatch.setattr(adapter, "cleanup", lambda *a, **kw: cleanup_calls.append((a, kw)))
+
+    adapter._send_single_request(
+        {"multimodal_output": None, "request": request, "is_finished": True, "is_segment_finished": True}
+    )
+
+    sent_payload = connector.put.call_args.kwargs["data"]
+    assert sent_payload.meta.finished.item() is False
+    assert sent_payload.meta.is_segment_finished.item() is False
+    assert cleanup_calls == []
+
+
 def test_send_single_request_personaplex_pending_frame_is_not_segment_boundary(
     build_adapter,
 ):

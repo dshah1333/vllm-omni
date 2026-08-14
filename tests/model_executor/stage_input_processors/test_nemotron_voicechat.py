@@ -232,6 +232,15 @@ def _streaming_request(prompt_len: int, generated: list[int], info: dict | None 
     )
 
 
+def _assert_open_codec_stream(payload) -> None:
+    """An empty duplex wake must not become a downstream segment boundary."""
+    assert payload is not None
+    assert payload.codes.audio.numel() == 0
+    assert payload.meta.codec_streaming is True
+    assert not bool(payload.meta.finished)
+    assert not bool(payload.meta.is_segment_finished)
+
+
 def test_thinker2talker_async_chunk_cumulative_timeline() -> None:
     from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
         thinker2talker_async_chunk,
@@ -383,6 +392,193 @@ def test_talker2code2wav_preserves_tensor_streaming_flag() -> None:
     )
 
     assert payload.meta.codec_streaming is True
+    assert not bool(payload.meta.finished)
+
+
+def test_talker2code2wav_duplex_cadence_retains_frames_across_wakes() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=2)
+    prompt_len = 3
+    req = _streaming_request(
+        prompt_len=prompt_len,
+        generated=[],
+        info={"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": prompt_len},
+    )
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+    prompt_rows = torch.zeros((prompt_len - 1, 31), dtype=torch.long)
+
+    # The runner exposes cumulative talker history on every wake. The producer
+    # trims the prompt prefix and retains the unseen acoustic suffix.
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            {
+                "codes": {"audio": torch.cat([prompt_rows, first_frame])},
+                "meta": {"codec_streaming": True},
+            },
+            req,
+            is_finished=False,
+        )
+    )
+
+    second_frame = torch.full((1, 31), 202, dtype=torch.long)
+    payload = talker2code2wav_async_chunk(
+        tm,
+        {
+            "codes": {"audio": torch.cat([prompt_rows, first_frame, second_frame])},
+            "meta": {"codec_streaming": True},
+        },
+        req,
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert payload.meta.left_context_size == 0
+    assert not bool(payload.meta.is_segment_finished)
+    assert payload.codes.audio.shape == (2, 31)
+    assert torch.equal(payload.codes.audio[0], first_frame[0])
+    assert torch.equal(payload.codes.audio[1], second_frame[0])
+
+
+def test_talker2code2wav_duplex_prompt_only_wake_starts_stream_once() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=2)
+    prompt_len = 3
+    req = _streaming_request(
+        prompt_len=prompt_len,
+        generated=[],
+        info={"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": prompt_len},
+    )
+    prompt_rows = torch.zeros((prompt_len - 1, 31), dtype=torch.long)
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            {"codes": {"audio": prompt_rows}, "meta": {"codec_streaming": True}},
+            req,
+            is_finished=False,
+        )
+    )
+
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            {"codes": {"audio": torch.cat([prompt_rows, first_frame])}, "meta": {"codec_streaming": True}},
+            req,
+            is_finished=False,
+        )
+    )
+    second_frame = torch.full((1, 31), 202, dtype=torch.long)
+    payload = talker2code2wav_async_chunk(
+        tm,
+        {
+            "codes": {"audio": torch.cat([prompt_rows, first_frame, second_frame])},
+            "meta": {"codec_streaming": True},
+        },
+        req,
+        is_finished=False,
+    )
+
+    assert payload is not None
+    assert torch.equal(payload.codes.audio, torch.cat([first_frame, second_frame]))
+
+
+def test_talker2code2wav_duplex_segment_end_does_not_terminate_stream() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=2)
+    req = _streaming_request(
+        prompt_len=1,
+        generated=[],
+        info={"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1},
+    )
+    pending = torch.full((1, 31), 303, dtype=torch.long)
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            {"codes": {"audio": pending}, "meta": {"codec_streaming": True}},
+            req,
+            is_finished=False,
+        )
+    )
+
+    # The talker's resumable request finishes one scheduler segment per wake.
+    # That is not a terminal codec marker and must neither flush cadence nor
+    # clear sender state.
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            None,
+            req,
+            is_finished=True,
+        )
+    )
+
+    second = torch.full((1, 31), 404, dtype=torch.long)
+    payload = talker2code2wav_async_chunk(
+        tm,
+        {"codes": {"audio": torch.cat([pending, second])}, "meta": {"codec_streaming": True}},
+        req,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert not bool(payload.meta.finished)
+    assert not bool(payload.meta.is_segment_finished)
+    assert payload.meta.codec_streaming is True
+    assert torch.equal(payload.codes.audio, torch.cat([pending, second]))
+
+
+def test_talker2code2wav_duplex_duplicate_cumulative_wake_does_not_replay_history() -> None:
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    tm = _fake_transfer_manager(codec_chunk_frames=2)
+    req = _streaming_request(
+        prompt_len=1,
+        generated=[],
+        info={"meta": {"codec_streaming": True}, "nvc_logical_prompt_len": 1},
+    )
+    first = torch.full((1, 31), 101, dtype=torch.long)
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            {"codes": {"audio": first}, "meta": {"codec_streaming": True}},
+            req,
+            is_finished=True,
+        )
+    )
+
+    # A scheduler wake can expose the exact same accumulated buffer again.
+    # It must preserve the pending row without appending a duplicate.
+    _assert_open_codec_stream(
+        talker2code2wav_async_chunk(
+            tm,
+            {"codes": {"audio": first.clone()}, "meta": {"codec_streaming": True}},
+            req,
+            is_finished=True,
+        )
+    )
+
+    second = torch.full((1, 31), 202, dtype=torch.long)
+    payload = talker2code2wav_async_chunk(
+        tm,
+        {"codes": {"audio": torch.cat([first, second])}, "meta": {"codec_streaming": True}},
+        req,
+        is_finished=True,
+    )
+    assert torch.equal(payload.codes.audio, torch.cat([first, second]))
+    assert tm.request_payload["req-0"]["nvc_frames_seen"] == 2
+    assert tm.request_payload["req-0"]["nvc_frames_sent"] == 2
 
 
 # =========================

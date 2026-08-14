@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexAppendPlan,
@@ -42,7 +42,15 @@ class NemotronVoiceChatDuplexRuntimeExtension:
         del runtime_config
         if not defaults:
             return defaults
-        configured = list(defaults)
+        # Every scheduler segment is one transport wake of a long-lived
+        # request.  CUMULATIVE output makes the multimodal output processor
+        # concatenate all earlier Stage-2 waveforms and resend them on every
+        # wake (80, 160, 240, ... ms), causing O(n^2) audio replay.  Duplex
+        # consumers require per-wake deltas at every stage.
+        configured = [params.clone() if isinstance(params, SamplingParams) else params for params in defaults]
+        for params in configured:
+            if isinstance(params, SamplingParams):
+                params.output_kind = RequestOutputKind.DELTA
         stage0 = defaults[0]
         if isinstance(stage0, SamplingParams):
             stage0 = stage0.clone()
@@ -51,6 +59,7 @@ class NemotronVoiceChatDuplexRuntimeExtension:
             stage0.top_k = 0
             stage0.max_tokens = 1
             stage0.ignore_eos = True
+            stage0.output_kind = RequestOutputKind.DELTA
             configured[0] = stage0
         return tuple(configured)
 

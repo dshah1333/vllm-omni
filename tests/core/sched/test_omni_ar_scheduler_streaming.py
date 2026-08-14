@@ -140,6 +140,41 @@ def test_resumable_session_terminal_is_not_marked_as_segment_boundary() -> None:
     assert output.is_segment_finished is False
 
 
+def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
+    """A WAITING_FOR_CHUNK stop must not delete its newly parked session."""
+    session = _make_request()
+    session.resumable = True
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    class _Queue:
+        def __init__(self, requests=()):
+            self.requests = set(requests)
+
+        def add_request(self, request):
+            self.requests.add(request)
+
+        def remove_requests(self, requests):
+            self.requests.difference_update(requests)
+
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched.running = []
+    sched.waiting = _Queue()
+    sched.skipped_waiting = _Queue((session,))
+    sched.num_waiting_for_streaming_input = 1
+    sched.chunk_transfer_adapter = SimpleNamespace(
+        segment_finished_requests={session.request_id}
+    )
+
+    sched._resume_downstream_chunk_receiver(session)
+    sched._remove_stopped_requests_from_queues(set(), {session})
+
+    assert session.status == RequestStatus.WAITING
+    assert session in sched.waiting.requests
+    assert session not in sched.skipped_waiting.requests
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.request_id not in sched.chunk_transfer_adapter.segment_finished_requests
+
+
 def test_update_from_output_settles_in_flight_tokens() -> None:
     """vLLM 0.26: schedule() increments num_in_flight_tokens per scheduled
     token; update_from_output must decrement it symmetrically. If the

@@ -378,7 +378,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_data = OmniPayloadStruct()
         if payload_data.meta is None:
             payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+        # A model-native codec stream may span many resumable scheduler
+        # requests.  Its processor is the only layer that knows whether a
+        # request finish is a transport wake or the lifetime of the codec
+        # state itself.  Preserve an explicit streaming lifetime decision;
+        # all ordinary producers keep the scheduler-derived default.
+        processor_controls_codec_lifetime = (
+            payload_data.meta.finished is not None
+            and self._is_truthy_scalar(payload_data.meta.codec_streaming)
+        )
+        if not processor_controls_codec_lifetime:
+            payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         if payload_data.meta.is_segment_finished is None:
             payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 

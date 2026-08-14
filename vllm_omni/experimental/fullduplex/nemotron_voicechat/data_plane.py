@@ -39,8 +39,9 @@ class NemotronVoiceChatDataPlaneContext:
 
 @dataclass(slots=True)
 class _RequestState:
-    pending_speech_end: bool = False
-    completed_speech_audio: bool = False
+    text_frames: int = 0
+    audio_frames: int = 0
+    pending_speech_end_frames: list[int] = field(default_factory=list)
     function_active: bool = False
     function_tokens: list[int] = field(default_factory=list)
     function_call_id: str | None = None
@@ -241,12 +242,12 @@ class NemotronVoiceChatDataPlaneSession:
                     getattr(completion, "token_ids", None) or getattr(completion, "cumulative_token_ids", None)
                 )
             for token_id in text_ids[-1:]:
+                state.text_frames += 1
                 if token_id == ids["eos"]:
-                    if state.completed_speech_audio:
-                        state.completed_speech_audio = False
+                    if state.audio_frames >= state.text_frames:
                         yield _speech_end_event(request_id)
                     else:
-                        state.pending_speech_end = True
+                        state.pending_speech_end_frames.append(state.text_frames)
                 elif token_id == ids["pad"]:
                     yield {
                         "stage_role": "llm",
@@ -284,9 +285,19 @@ class NemotronVoiceChatDataPlaneSession:
             if wants_audio and audio is not None
             else None
         )
-        segment_finished = bool(getattr(output, "finished", False) or getattr(outer, "finished", False))
-        speech_audio_finished = segment_finished and sample_count > 0
-        end_of_turn = speech_audio_finished and state.pending_speech_end
+        audio_chunk_complete = sample_count > 0
+        if audio_chunk_complete:
+            # A native-duplex Stage-2 segment can contain one or more 80 ms
+            # codec frames.  Count them against the frame-locked Stage-0 text
+            # channel. The long-lived codec request deliberately keeps
+            # ``finished=False`` across scheduler wakes; a non-empty decoded
+            # chunk, not request lifetime, is the audio-coverage signal.
+            duration_ms = sample_count * 1000 / max(1, sample_rate)
+            state.audio_frames += max(1, round(duration_ms / 80))
+        end_of_turn = (
+            bool(state.pending_speech_end_frames)
+            and state.audio_frames >= state.pending_speech_end_frames[0]
+        )
         if encoded:
             yield {
                 "stage_role": "tts",
@@ -303,13 +314,7 @@ class NemotronVoiceChatDataPlaneSession:
         elif end_of_turn:
             yield _speech_end_event(request_id)
         if end_of_turn:
-            state.pending_speech_end = False
-        elif speech_audio_finished:
-            # Stage-2 audio and Stage-0 EOS are independently projected. Keep
-            # the speech completion as a latch so either arrival order closes
-            # exactly one response. Empty/listen segments must not satisfy a
-            # later EOS.
-            state.completed_speech_audio = True
+            state.pending_speech_end_frames.pop(0)
 
     def _project_function_token(
         self,
