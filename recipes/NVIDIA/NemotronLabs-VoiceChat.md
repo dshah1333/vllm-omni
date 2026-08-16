@@ -35,8 +35,7 @@ NeMo modules (`nemo_vendored/`), so no `nemo_toolkit` install is needed.
   [`vllm_omni/deploy/nemotron_labs_voicechat.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat.yaml)
 - Native duplex config and E2E probe:
   [`vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml`](../../vllm_omni/deploy/nemotron_labs_voicechat_duplex.yaml),
-  [`tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py`](../../tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py),
-  [`tests/e2e/online_serving/test_nemotron_voicechat_duplex.py`](../../tests/e2e/online_serving/test_nemotron_voicechat_duplex.py)
+  [`tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py`](../../tests/e2e/online_serving/nemotron_voicechat_realtime_duplex.py)
 - Upstream model card:
   [`nvidia/NVIDIA-NemotronLabs-VoiceChat-11B`](https://huggingface.co/nvidia/NVIDIA-NemotronLabs-VoiceChat-11B)
 - Reference implementation: NVIDIA-NeMo/Speech, branch `nemotron-labs-voicechat`
