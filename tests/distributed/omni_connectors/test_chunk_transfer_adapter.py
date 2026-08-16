@@ -1013,6 +1013,66 @@ def test_cleanup_only_affects_target_request(build_adapter):
     assert "req-b" in adapter.request_ids_mapping
 
 
+def test_abort_clears_native_codec_state_before_external_id_reuse(build_adapter):
+    """An aborted codec stream must not leak state into a replacement stream."""
+    from vllm_omni.model_executor.stage_input_processors.nemotron_voicechat import (
+        talker2code2wav_async_chunk,
+    )
+
+    adapter, _ = build_adapter(
+        stage_id=1,
+        connector_extra={"codec_chunk_frames": 1},
+    )
+    external_req_id = "ext-native-abort"
+    first = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    first.resumable = True
+    first.additional_information = {
+        "meta": {"codec_streaming": True},
+        "nvc_logical_prompt_len": 1,
+    }
+    first_frame = torch.full((1, 31), 101, dtype=torch.long)
+
+    payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": first_frame}, "meta": {"codec_streaming": True}},
+        first,
+        is_finished=False,
+    )
+    assert payload is not None
+    assert not bool(payload.meta.finished)
+    assert external_req_id in adapter.request_payload
+
+    adapter.put_req_chunk[external_req_id] = 1
+    adapter.requests_num_chunks_sent[external_req_id] = 1
+    adapter.request_ids_mapping[first.request_id] = external_req_id
+    adapter.finish_requests(
+        [first.request_id],
+        RequestStatus.FINISHED_ABORTED,
+        {first.request_id: first},
+    )
+
+    assert external_req_id not in adapter.request_payload
+    assert external_req_id not in adapter.put_req_chunk
+    assert external_req_id not in adapter.requests_num_chunks_sent
+    assert first.request_id not in adapter.request_ids_mapping
+
+    replacement = _req("req-native-abort", RequestStatus.WAITING, external_req_id=external_req_id)
+    replacement.resumable = True
+    replacement.additional_information = first.additional_information
+    adapter.load_async(replacement)
+    assert replacement.request_id not in adapter._cancelled_load_reqs
+    second_frame = torch.full((1, 31), 202, dtype=torch.long)
+    replacement_payload = talker2code2wav_async_chunk(
+        adapter,
+        {"codes": {"audio": second_frame}, "meta": {"codec_streaming": True}},
+        replacement,
+        is_finished=False,
+    )
+
+    assert replacement_payload is not None
+    assert torch.equal(replacement_payload.codes.audio, second_frame)
+
+
 def test_cleanup_after_poll_flow(build_adapter):
     """Simulate full load_async -> poll -> finished -> cleanup cycle."""
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")

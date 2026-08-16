@@ -287,8 +287,9 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         # offline_inference lines around get_init_inputs/first forward).
         self.tts.set_init_inputs(speaker_name=self._speaker_name)
         init_inputs = self.tts.get_init_inputs(B=1)
-        generation_config = self.tts._get_generation_config(self._guidance_enabled())
-        init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": self._guidance_enabled()})
+        guidance_enabled = self._guidance_enabled()
+        generation_config = self.tts._get_generation_config(guidance_enabled)
+        init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": guidance_enabled})
         with torch.inference_mode():
             outputs = self.tts.tts_model(**init_inputs)
         prompt_len = self._logical_prompt_len(info)
@@ -310,7 +311,9 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             "past_key_values": outputs.past_key_values,
             "code": init_inputs["code"][:, -1:],
             "first_context_subword_id": init_inputs["subword_ids"][:, -1].unsqueeze(-1),
+            "current_subword_mask": torch.ones(1, 1, device=device, dtype=torch.bool),
             "tts_initialized": False,
+            "guidance_enabled": guidance_enabled,
             "generation_config": generation_config,
             "codes_rows": [],
             "codec_streaming": codec_streaming,
@@ -357,15 +360,14 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             session["tts_initialized"] = True
         else:
             prev_subword_id = timeline[t - 1].reshape(1, 1)
-        current_subword_mask = torch.ones(1, 1, device=timeline.device, dtype=torch.bool)
         with torch.inference_mode():
             code, past_key_values = self.tts.infer_codes_one_step(
                 current_subword_id=current_subword_id,
                 prev_subword_id=prev_subword_id,
-                current_subword_mask=current_subword_mask,
+                current_subword_mask=session["current_subword_mask"],
                 prev_audio_tokens=session["code"],
                 past_key_values=session["past_key_values"],
-                guidance_enabled=self._guidance_enabled(),
+                guidance_enabled=session["guidance_enabled"],
                 generation_config=session["generation_config"],
                 ignore_eos_flag_stop=True,
             )
@@ -413,10 +415,13 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         finished = False
         steps_run = 0
         new_code_rows: list[torch.Tensor] = []
+        codec_streaming = bool(session["codec_streaming"])
         while int(session["step"]) < int(session["timeline"].numel()):
             codes_row, finished = self._step_session(session)
-            new_code_rows.append(codes_row.cpu())
-            if not session["codec_streaming"]:
+            if codec_streaming:
+                # One D2H copy per wake is enough; avoid synchronizing after every drained TTS step.
+                new_code_rows.append(codes_row)
+            else:
                 session["codes_rows"].append(codes_row.cpu())
             steps_run += 1
             if session["sync_mode"]:
@@ -431,7 +436,7 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 embeds[:, 0] = 1.0
             return input_ids, embeds, {}
         cumulative = torch.cat(
-            new_code_rows if session["codec_streaming"] else session["codes_rows"],
+            new_code_rows if codec_streaming else session["codes_rows"],
             dim=0,
         )
         if finished:

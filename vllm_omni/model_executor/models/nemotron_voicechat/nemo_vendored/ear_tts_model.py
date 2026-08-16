@@ -504,7 +504,15 @@ def depthsum_encoding_step(
     code: Tensor,
     depth_str: int = 0,
     k: int = 72,
+    code_latent: Tensor | None = None,
 ) -> Tensor:
+    """Quantize one codebook group and optionally accumulate its embeddings.
+
+    ``generate_step`` needs the selected embeddings both for residual
+    quantization and for the next MoG iteration. Reusing the embedding looked
+    up here avoids a second ``F.embedding`` pass while preserving the original
+    depth order when ``code_latent`` is provided.
+    """
     for i in range(depth_str, depth_str + k):
         idx_sel = (
             embs_squared_norm[i]  # [g?, v]
@@ -514,6 +522,8 @@ def depthsum_encoding_step(
 
         emb_i = F.embedding(idx_sel, embs[i])
         r = r - emb_i
+        if code_latent is not None:
+            code_latent.add_(emb_i)
 
         code[..., i] = idx_sel
 
@@ -976,8 +986,8 @@ class GatedProjectedSumRMSNorm(nn.Module):
         audio_emb = audio_emb / self.num_codebooks
 
         # projections run in model dtype (BF16)
-        audio_h = self.audio_proj(audio_emb)
-        text_h = self.text_proj(text_emb)
+        audio_h = self.audio_proj(audio_emb.to(dtype=self.audio_proj.weight.dtype))
+        text_h = self.text_proj(text_emb.to(dtype=self.text_proj.weight.dtype))
 
         dtype = audio_h.dtype
 
@@ -1352,7 +1362,7 @@ class RVQEARTTSModel(nn.Module):
             pre_bos_mask = bos_mask.cumsum(dim=1) == 0  # [B, T, 1]
 
             # Apply projection to model size
-            code_embed = self.embed_code(code_embed)
+            code_embed = self.embed_code(code_embed.to(dtype=self.embed_code.weight.dtype))
 
             # Choose projection
             if self.config.get("audio_prompt_encoder_config", None):
@@ -1386,7 +1396,7 @@ class RVQEARTTSModel(nn.Module):
             code_embeds = code_embed + bos_mask * self.bos_emb
 
         else:  # Inference
-            code_embeds = self.embed_code(self.depthsum_embedding(code))
+            code_embeds = self.embed_code(self.depthsum_embedding(code).to(dtype=self.embed_code.weight.dtype))
             uncond_dec_flag = torch.zeros(code.size(0), 1, 1, device=code.device, dtype=torch.bool)
 
         if guidance_enabled:
@@ -1674,17 +1684,10 @@ class RVQEARTTSModel(nn.Module):
                 code,
                 cnt,
                 k,
+                code_latent if cnt + k < d else None,
             )
             # The latent is only consumed by a later MoG iteration; the final
-            # 22-codebook group does not need to be embedded at all.
-            if cnt + k < d:
-                code_latent = update_depthsum_embedding(
-                    code_latent,
-                    code,
-                    self.rvq_embs,
-                    cnt,
-                    k,
-                )
+            # 22-codebook group does not need to be accumulated at all.
             cnt += k
         return code, lm_logits, eos_flag
 

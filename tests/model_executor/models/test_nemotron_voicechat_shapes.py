@@ -387,6 +387,51 @@ def test_precomputed_rvq_norm_preserves_residual_codes() -> None:
     assert torch.equal(actual, reference)
 
 
+def test_depthsum_encoding_reuses_selected_embeddings_for_latent() -> None:
+    import torch
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
+        depthsum_encoding_step,
+        update_depthsum_embedding,
+    )
+
+    generator = torch.Generator().manual_seed(16081)
+    embs = torch.randn(5, 16, 8, generator=generator)
+    residual = torch.randn(2, 1, 8, generator=generator)
+    code = torch.full((2, 1, 5), 16, dtype=torch.long)
+    code[..., :3] = torch.randint(16, (2, 1, 3), generator=generator)
+    norms = embs.pow(2).sum(-1)
+    actual_latent = torch.zeros_like(residual)
+
+    actual_code = depthsum_encoding_step(
+        embs,
+        norms,
+        residual.clone(),
+        code.clone(),
+        0,
+        3,
+        actual_latent,
+    )
+    expected_code = depthsum_encoding_step(
+        embs,
+        norms,
+        residual.clone(),
+        code.clone(),
+        0,
+        3,
+    )
+    expected_latent = update_depthsum_embedding(
+        torch.zeros_like(residual),
+        expected_code,
+        embs,
+        0,
+        3,
+    )
+
+    assert torch.equal(actual_code, expected_code)
+    assert torch.equal(actual_latent, expected_latent)
+
+
 def test_precomputed_rvq_norm_is_not_a_checkpoint_weight() -> None:
     import torch
 
@@ -401,6 +446,28 @@ def test_precomputed_rvq_norm_is_not_a_checkpoint_weight() -> None:
     assert "rvq_embs" in module.state_dict()
     assert "rvq_embs_squared_norm" not in module.state_dict()
     assert torch.equal(module.rvq_embs_squared_norm, rvq_embs.pow(2).sum(-1))
+
+
+def test_gated_fusion_casts_conditioning_to_projection_dtype() -> None:
+    import torch
+
+    from vllm_omni.model_executor.models.nemotron_voicechat.nemo_vendored.ear_tts_model import (
+        GatedProjectedSumRMSNorm,
+    )
+
+    fusion = GatedProjectedSumRMSNorm(
+        audio_dim=2,
+        text_dim=3,
+        hidden_dim=4,
+        final_norm=False,
+    ).to(dtype=torch.bfloat16)
+    audio = torch.randn((1, 1, 2), dtype=torch.float32)
+    text = torch.randn((1, 1, 3), dtype=torch.float32)
+
+    output = fusion(audio, text)
+
+    assert output.dtype is torch.bfloat16
+    assert output.shape == (1, 1, 4)
 
 
 def test_torchaudio_mel_filterbank_matches_librosa() -> None:

@@ -487,8 +487,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def cleanup_sender(self, external_req_id: str) -> None:
         """Reclaim sender-side per-request state (keyed by external id).
 
-        Must only be called after the terminal chunk has actually been
-        sent (i.e. from ``_send_single_request``), not before.
+        Called after a terminal chunk is sent or when the scheduler aborts the
+        request before a terminal chunk can be produced. The abort path must
+        reclaim the state so a later request can reuse the external id.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
@@ -836,6 +837,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             request_ids = requests.keys()
 
         # First pass: collect requests to remove from queues
+        request_ids = set(request_ids)
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
             if request is None or request.is_finished():
@@ -844,7 +846,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if req_id in self.requests_origin_status:
                 request.status = self.requests_origin_status.pop(req_id)
 
-        request_ids = set(request_ids)
+        # An abort can terminate a long-lived native codec stream before it
+        # emits a terminal payload. Reclaim both sides of the adapter so a
+        # later request reusing the same external id starts with empty state.
+        for req_id in request_ids:
+            request = requests.get(req_id) if requests else None
+            external_req_id = (
+                getattr(request, "external_req_id", None)
+                if request is not None
+                else self.request_ids_mapping.get(req_id)
+            ) or req_id
+            self.cleanup_receiver(req_id)
+            self.cleanup_sender(external_req_id)
 
         self.waiting_for_chunk_waiting_requests = deque(
             request for request in self.waiting_for_chunk_waiting_requests if request.request_id not in request_ids
