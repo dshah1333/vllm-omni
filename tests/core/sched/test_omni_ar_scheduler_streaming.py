@@ -161,9 +161,7 @@ def test_chunk_segment_cleanup_keeps_requeued_resumable_receiver() -> None:
     sched.waiting = _Queue()
     sched.skipped_waiting = _Queue((session,))
     sched.num_waiting_for_streaming_input = 1
-    sched.chunk_transfer_adapter = SimpleNamespace(
-        segment_finished_requests={session.request_id}
-    )
+    sched.chunk_transfer_adapter = SimpleNamespace(segment_finished_requests={session.request_id})
 
     sched._resume_downstream_chunk_receiver(session)
     sched._remove_stopped_requests_from_queues(set(), {session})

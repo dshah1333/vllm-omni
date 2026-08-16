@@ -383,9 +383,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # request finish is a transport wake or the lifetime of the codec
         # state itself.  Preserve an explicit streaming lifetime decision;
         # all ordinary producers keep the scheduler-derived default.
-        processor_controls_codec_lifetime = (
-            payload_data.meta.finished is not None
-            and self._is_truthy_scalar(payload_data.meta.codec_streaming)
+        processor_controls_codec_lifetime = payload_data.meta.finished is not None and self._is_truthy_scalar(
+            payload_data.meta.codec_streaming
         )
         if not processor_controls_codec_lifetime:
             payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)

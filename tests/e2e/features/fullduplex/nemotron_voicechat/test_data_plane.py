@@ -133,11 +133,7 @@ def test_previous_audio_frame_does_not_satisfy_later_text_eos() -> None:
     projector = _projector(lambda *_: "audio")
     projector._decode = lambda _token_ids: "hello"
 
-    assert not [
-        event
-        for event in projector.project_output(_stage0_output(42))
-        if event.get("end_of_turn") is True
-    ]
+    assert not [event for event in projector.project_output(_stage0_output(42)) if event.get("end_of_turn") is True]
     first_audio = list(
         projector.project_output(
             _stage2_output(np.ones(1764, dtype=np.float32), finished=True),

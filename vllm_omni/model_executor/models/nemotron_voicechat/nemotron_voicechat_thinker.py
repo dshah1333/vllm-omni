@@ -264,9 +264,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         streaming_preprocessor_cfg = copy.deepcopy(self.perception.cfg.preprocessor)
         streaming_preprocessor_cfg.dither = 0.0
         streaming_preprocessor_cfg.pad_to = 0
-        self._streaming_preprocessor = self.perception.from_config_dict(
-            streaming_preprocessor_cfg
-        )
+        self._streaming_preprocessor = self.perception.from_config_dict(streaming_preprocessor_cfg)
 
         # AddFusion weights (the checkpoint uses fuse_method="add" defaults;
         # the same duplex_*_weight keys double as the fusion weights).
@@ -467,8 +465,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         else:
             if source_input_seq != 1:
                 raise ValueError(
-                    "Nemotron VoiceChat cache-aware perception must start at "
-                    f"input sequence 1, got {source_input_seq}"
+                    f"Nemotron VoiceChat cache-aware perception must start at input sequence 1, got {source_input_seq}"
                 )
             audio = frame_audio
 
@@ -502,20 +499,18 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     raise RuntimeError("Nemotron VoiceChat perception cache is missing")
 
             encoder_dtype = next(encoder.parameters()).dtype
-            encoded, encoded_len, cache_channel, cache_time, cache_channel_len = (
-                encoder.cache_aware_stream_step(
-                    processed_signal=mel_chunk.to(encoder_dtype),
-                    processed_signal_length=torch.tensor(
-                        [mel_chunk.shape[-1]],
-                        device=device,
-                        dtype=torch.long,
-                    ),
-                    cache_last_channel=caches[0],
-                    cache_last_time=caches[1],
-                    cache_last_channel_len=caches[2],
-                    keep_all_outputs=True,
-                    drop_extra_pre_encoded=drop_extra_pre_encoded,
-                )
+            encoded, encoded_len, cache_channel, cache_time, cache_channel_len = encoder.cache_aware_stream_step(
+                processed_signal=mel_chunk.to(encoder_dtype),
+                processed_signal_length=torch.tensor(
+                    [mel_chunk.shape[-1]],
+                    device=device,
+                    dtype=torch.long,
+                ),
+                cache_last_channel=caches[0],
+                cache_last_time=caches[1],
+                cache_last_channel_len=caches[2],
+                keep_all_outputs=True,
+                drop_extra_pre_encoded=drop_extra_pre_encoded,
             )
             encoded, encoded_len = self.perception.modality_adapter(
                 audio_signal=encoded,

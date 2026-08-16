@@ -1659,9 +1659,7 @@ class RVQEARTTSModel(nn.Module):
             top_p_or_k_i = top_p_or_k[i] if top_p_or_k is not None else 1.0
             noise_scale_i = noise_scale[i] if noise_scale is not None else 1.0
 
-            mog_input_embeds = self.embed_code(
-                code_latent.to(self.embed_code.weight.dtype)
-            )
+            mog_input_embeds = self.embed_code(code_latent.to(self.embed_code.weight.dtype))
             if self.config.random_target_masking:
                 mog_input_embeds += self.embed_target_mask.weight[cnt + k - 1]
             if guidance_scale_i > 0.0:

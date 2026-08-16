@@ -351,9 +351,7 @@ def talker2code2wav_async_chunk(
             finished=torch.tensor(stream_finished, dtype=torch.bool),
             # Native duplex scheduler segments are transport wakes, not codec
             # stream boundaries.  Preserve polling across successive wakes.
-            is_segment_finished=(
-                torch.tensor(False, dtype=torch.bool) if codec_streaming else None
-            ),
+            is_segment_finished=(torch.tensor(False, dtype=torch.bool) if codec_streaming else None),
         ),
     )
 

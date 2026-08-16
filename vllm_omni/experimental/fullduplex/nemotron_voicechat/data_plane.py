@@ -294,10 +294,7 @@ class NemotronVoiceChatDataPlaneSession:
             # chunk, not request lifetime, is the audio-coverage signal.
             duration_ms = sample_count * 1000 / max(1, sample_rate)
             state.audio_frames += max(1, round(duration_ms / 80))
-        end_of_turn = (
-            bool(state.pending_speech_end_frames)
-            and state.audio_frames >= state.pending_speech_end_frames[0]
-        )
+        end_of_turn = bool(state.pending_speech_end_frames) and state.audio_frames >= state.pending_speech_end_frames[0]
         if encoded:
             yield {
                 "stage_role": "tts",

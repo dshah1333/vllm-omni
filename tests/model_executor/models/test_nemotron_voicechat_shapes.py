@@ -59,6 +59,7 @@ def test_streaming_mel_slice_matches_nemo_cache_geometry() -> None:
     )
     assert third.flatten().tolist() == list(range(17))
 
+
 # Perception config subset matching the checkpoint (mel 10 ms hop, n_fft 512,
 # dw-striding 8x CAUSAL subsampling, conv kernel 3). causal_downsampling is
 # what the real checkpoint sets; omitting it here is exactly what let the
@@ -372,11 +373,7 @@ def test_precomputed_rvq_norm_preserves_residual_codes() -> None:
     for quantizer_idx in range(5):
         selected = (
             embs[quantizer_idx].pow(2).sum(-1)
-            - 2
-            * (
-                running.unsqueeze(-2)
-                @ embs[quantizer_idx].transpose(-1, -2)
-            ).squeeze(-2)
+            - 2 * (running.unsqueeze(-2) @ embs[quantizer_idx].transpose(-1, -2)).squeeze(-2)
         ).argmin(-1)
         running = running - torch.nn.functional.embedding(
             selected,

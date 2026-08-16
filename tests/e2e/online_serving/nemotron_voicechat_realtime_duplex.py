@@ -188,10 +188,13 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
     session_id = f"nemotron-voicechat-{uuid.uuid4().hex}"
     client = RealtimeDuplexClient(_url(args.url, args.model, session_id))
     started_at = time.monotonic()
-    async with client, _close_and_capture_failures(
+    async with (
         client,
-        output_dir=output_dir,
-        timeout_s=args.timeout_s,
+        _close_and_capture_failures(
+            client,
+            output_dir=output_dir,
+            timeout_s=args.timeout_s,
+        ),
     ):
         session_payload: dict[str, object] = {
             "session_id": session_id,
@@ -257,8 +260,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
                         client.events.count("response.audio.delta") >= args.minimum_audio_chunks
                         and (
                             args.allow_incomplete_response
-                            or client.events.count("response.done")
-                            > completed_responses_at_commit
+                            or client.events.count("response.done") > completed_responses_at_commit
                         )
                     )
                 )
@@ -290,14 +292,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
             raise AssertionError(f"no completed function call: {function_events}")
         if args.expect_function_call:
             matching_items = [
-                event["item"]
-                for event in function_items
-                if event["item"].get("name") == args.expected_function_name
+                event["item"] for event in function_items if event["item"].get("name") == args.expected_function_name
             ]
             if not matching_items:
-                raise AssertionError(
-                    f"expected function {args.expected_function_name!r}, got {function_items}"
-                )
+                raise AssertionError(f"expected function {args.expected_function_name!r}, got {function_items}")
             try:
                 function_arguments = json.loads(str(matching_items[-1].get("arguments", "")))
             except json.JSONDecodeError as exc:
@@ -307,11 +305,7 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
 
         audio = client.events.audio_bytes()
         audio_events = _events(client, "response.audio.delta")
-        rates = {
-            int(event["sample_rate_hz"])
-            for event in audio_events
-            if isinstance(event.get("sample_rate_hz"), int)
-        }
+        rates = {int(event["sample_rate_hz"]) for event in audio_events if isinstance(event.get("sample_rate_hz"), int)}
         if not args.expect_function_call and audio and rates != {OUTPUT_SAMPLE_RATE_HZ}:
             raise AssertionError(f"unexpected output sample rates: {rates}")
         if not args.expect_function_call and args.minimum_audio_chunks and not audio:
@@ -319,12 +313,10 @@ async def run(args: argparse.Namespace) -> dict[str, object]:
         packet_durations_ms = _audio_packet_durations_ms(audio_events)
         expected_packet_ms = float(expected["chunk_period_ms"])
         if not args.expect_function_call and any(
-            not math.isclose(duration_ms, expected_packet_ms, abs_tol=0.01)
-            for duration_ms in packet_durations_ms
+            not math.isclose(duration_ms, expected_packet_ms, abs_tol=0.01) for duration_ms in packet_durations_ms
         ):
             raise AssertionError(
-                f"audio deltas are not fixed {expected_packet_ms:g} ms codec increments: "
-                f"{packet_durations_ms}"
+                f"audio deltas are not fixed {expected_packet_ms:g} ms codec increments: {packet_durations_ms}"
             )
         audio_pcm = np.frombuffer(audio, dtype="<i2").astype(np.float32) / 32768.0
         audio_rms = float(np.sqrt(np.mean(np.square(audio_pcm)))) if audio_pcm.size else 0.0

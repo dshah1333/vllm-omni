@@ -838,13 +838,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         encoded, encoded_len, cache_channel, cache_time, cache_channel_len = rets
         if cache_channel is not None and self.streaming_cfg.last_channel_cache_size >= 0:
             if self.streaming_cfg.last_channel_cache_size > 0:
-                cache_channel = cache_channel[
-                    :, :, -self.streaming_cfg.last_channel_cache_size :, :
-                ]
+                cache_channel = cache_channel[:, :, -self.streaming_cfg.last_channel_cache_size :, :]
 
-        if self.streaming_cfg.valid_out_len > 0 and (
-            not keep_all_outputs or self.att_context_style == "regular"
-        ):
+        if self.streaming_cfg.valid_out_len > 0 and (not keep_all_outputs or self.att_context_style == "regular"):
             encoded = encoded[:, :, : self.streaming_cfg.valid_out_len]
             encoded_len = torch.clamp(encoded_len, max=self.streaming_cfg.valid_out_len)
 
