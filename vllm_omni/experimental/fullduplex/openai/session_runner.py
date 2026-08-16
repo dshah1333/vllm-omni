@@ -451,6 +451,13 @@ class DuplexSessionRunnerMixin:
                     return False
                 return await _run()
 
+            def _release_cancelled_retained_audio(done: asyncio.Task[bool]) -> None:
+                if done.cancelled() and (
+                    retained_committed_payload is not None
+                    and native.committed_audio_payload is retained_committed_payload
+                ):
+                    session.release_input_bytes(native.clear_committed_audio())
+
             predecessor = actor.native_append_tail
             if predecessor is not None and predecessor.done():
                 try:
@@ -463,6 +470,7 @@ class DuplexSessionRunnerMixin:
                     # is an explicit retry and starts a new chain.
                     predecessor = None
             task = asyncio.create_task(_run_in_wire_order(predecessor))
+            task.add_done_callback(_release_cancelled_retained_audio)
             actor.native_append_tail = task
             actor.track_append_task(
                 task,

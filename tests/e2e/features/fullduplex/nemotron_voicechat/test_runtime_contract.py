@@ -44,6 +44,7 @@ def _plan(extension, *, input_seq: int):
         runtime_config={
             "nvc_prompt_token_ids": [0, 42, 1],
             "nvc_text_pad_id": 12,
+            "nvc_max_model_len": 8192,
         },
         seq=input_seq,
         turn_seq=input_seq,
@@ -97,7 +98,11 @@ def test_runtime_rejects_non_frame_payloads() -> None:
             request_id="req",
             fence=DuplexFence("sid"),
             session_config={},
-            runtime_config={"nvc_prompt_token_ids": [0, 1], "nvc_text_pad_id": 12},
+            runtime_config={
+                "nvc_prompt_token_ids": [0, 1],
+                "nvc_text_pad_id": 12,
+                "nvc_max_model_len": 8192,
+            },
             seq=1,
             turn_seq=1,
             mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
@@ -117,6 +122,41 @@ def test_runtime_forces_greedy_single_token_thinker() -> None:
     assert configured[0].ignore_eos is True
     assert all(params.output_kind == RequestOutputKind.DELTA for params in configured)
     assert all(configured[index] is not defaults[index] for index in range(len(defaults)))
+
+
+def test_runtime_rejects_frame_before_stage0_context_overflow() -> None:
+    extension = NemotronVoiceChatDuplexRuntimeExtension()
+    runtime_config = {
+        "nvc_prompt_token_ids": [0, 42, 1],
+        "nvc_text_pad_id": 12,
+        "nvc_max_model_len": 6,
+    }
+
+    extension.plan_append(
+        request_id="req",
+        fence=DuplexFence("sid"),
+        session_config={},
+        runtime_config=runtime_config,
+        seq=2,
+        turn_seq=2,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload=_frame(),
+        final=False,
+        sampling_params=SamplingParams(),
+    )
+    with pytest.raises(ValueError, match=r"input_frames=3.*7 > 6"):
+        extension.plan_append(
+            request_id="req",
+            fence=DuplexFence("sid"),
+            session_config={},
+            runtime_config=runtime_config,
+            seq=3,
+            turn_seq=3,
+            mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+            payload=_frame(),
+            final=False,
+            sampling_params=SamplingParams(),
+        )
 
 
 def test_stage0_token_is_a_direct_duplex_side_channel() -> None:
@@ -204,6 +244,7 @@ async def test_prepare_runtime_reuses_serving_tokenizer_in_data_plane(monkeypatc
         instructions="hello",
     )
     model_config = SimpleNamespace(
+        max_model_len=8192,
         hf_config=SimpleNamespace(
             stt_cfg={
                 "pretrained_llm": "configured-tokenizer",
@@ -211,7 +252,7 @@ async def test_prepare_runtime_reuses_serving_tokenizer_in_data_plane(monkeypatc
                 "eos_token": "<eos>",
                 "pad_token": "<pad>",
             }
-        )
+        ),
     )
 
     runtime = await adapter.prepare_runtime_config(config, model_config=model_config)
@@ -219,6 +260,7 @@ async def test_prepare_runtime_reuses_serving_tokenizer_in_data_plane(monkeypatc
     assert runtime["nvc_text_bos_id"] == 101
     assert runtime["nvc_text_eos_id"] == 102
     assert runtime["nvc_text_pad_id"] == 103
+    assert runtime["nvc_max_model_len"] == 8192
     assert adapter.data_plane._special_ids == {
         "bos": 101,
         "eos": 102,

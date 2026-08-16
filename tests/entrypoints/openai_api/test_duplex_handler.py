@@ -5058,6 +5058,130 @@ async def test_native_append_is_cancelled_by_later_wire_order_input_cancel():
 
 
 @pytest.mark.asyncio
+async def test_response_cancel_releases_nemotron_retained_terminal_frame(monkeypatch):
+    from vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter import (
+        NemotronVoiceChatServingRuntimeAdapter,
+    )
+
+    class CancelFirstFinalAppendEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_append_started = asyncio.Event()
+            self.first_append_cancelled = asyncio.Event()
+            self.attempted_payloads: list[dict[str, object]] = []
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            payload = kwargs["payload"]
+            assert isinstance(payload, dict)
+            self.attempted_payloads.append(payload)
+            if len(self.attempted_payloads) == 1:
+                self.first_append_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.first_append_cancelled.set()
+                    raise
+            kwargs.pop("expected_epoch", None)
+            return await super().append_duplex_input_async(session_id, **kwargs)
+
+    tokenizer = SimpleNamespace(decode=lambda *_args, **_kwargs: "")
+    runtime = {
+        "instructions": "test",
+        "nvc_prompt_token_ids": [0, 1],
+        "nvc_text_bos_id": 0,
+        "nvc_text_eos_id": 1,
+        "nvc_text_pad_id": 12,
+        "nvc_function_sotc_id": 20,
+        "nvc_function_eotc_id": 21,
+        "nvc_function_eotr_id": 22,
+        "nvc_tokenizer_ref": "test-tokenizer",
+    }
+    monkeypatch.setattr(
+        "vllm_omni.experimental.fullduplex.nemotron_voicechat.serving_adapter._tokenize_runtime",
+        lambda *_args, **_kwargs: (dict(runtime), tokenizer),
+    )
+
+    session_id = "sid-nemotron-cancel-retained"
+    engine = CancelFirstFinalAppendEngine()
+    chat_service = FakeChatService(engine)
+    chat_service.model_config = SimpleNamespace(max_model_len=8192)
+    adapter = NemotronVoiceChatServingRuntimeAdapter(lambda *_args: None)
+    handler = OmniDuplexSessionHandler(
+        chat_service=chat_service,
+        config_timeout_s=0.1,
+        idle_timeout_s=5,
+        serving_runtime_adapter=adapter,
+    )
+    ws = TimedWebSocket(receive_timeout_s=5)
+    create = _native_session_create(session_id)
+    create["session"]["model"] = "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"
+    create["session"]["idle_timeout_s"] = 5
+    create["session"]["extra_body"] = {"auto_response": True}
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    try:
+        for _ in range(100):
+            session = handler._registry.get(session_id)
+            if session is not None and "session.created" in ws.sent_types():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("Nemotron duplex session did not open")
+
+        cancelled_request_id = handler._native_stage0_request_id(session, session.epoch)
+        session.bind_request(cancelled_request_id)
+        adapter.data_plane.begin_request(cancelled_request_id)
+        partial = {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(640),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        }
+        ws.put(partial)
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+        await asyncio.wait_for(engine.first_append_started.wait(), timeout=1)
+
+        ws.put({"type": "response.cancel"})
+        await asyncio.wait_for(engine.first_append_cancelled.wait(), timeout=1)
+        for _ in range(100):
+            native = adapter.session_states[session_id]
+            if (
+                native.committed_audio_payload is None
+                and session.pending_input_bytes == 0
+                and cancelled_request_id not in adapter.data_plane._requests
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("cancelled terminal frame remained retained")
+
+        assert native.committed_audio_reserved_bytes == 0
+        assert cancelled_request_id not in adapter.data_plane._requests
+        ws.put(partial)
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+        for _ in range(100):
+            if len(engine.attempted_payloads) == 2 and session.pending_input_bytes == 0:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail(
+                "post-cancel terminal frame did not complete: "
+                f"attempts={len(engine.attempted_payloads)}, "
+                f"pending_bytes={session.pending_input_bytes}, "
+                f"events={[(event.get('type'), event.get('code')) for event in ws.sent]}"
+            )
+
+        second_raw = base64.b64decode(str(engine.attempted_payloads[1]["audio"]))
+        assert np.frombuffer(second_raw, dtype="<f4").shape == (1280,)
+        assert native.committed_audio_payload is None
+        assert native.committed_audio_reserved_bytes == 0
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+
+@pytest.mark.asyncio
 async def test_minicpmo_native_duplex_append_control_error_does_not_emit_model_delta():
     control_result = {
         "operation": "append",

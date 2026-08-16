@@ -435,10 +435,12 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             if finished:
                 embeds[:, 0] = 1.0
             return input_ids, embeds, {}
-        cumulative = torch.cat(
-            new_code_rows if codec_streaming else session["codes_rows"],
-            dim=0,
-        )
+        if codec_streaming:
+            # The code2wav producer owns suffix slicing and therefore requires
+            # cumulative history on every wake. Keep the history on CPU and do
+            # one D2H transfer for all rows produced by this wake.
+            session["codes_rows"].append(torch.cat(new_code_rows, dim=0).cpu())
+        cumulative = torch.cat(session["codes_rows"], dim=0)
         if finished:
             embeds[:, 0] = 1.0  # stop flag -> compute_logits emits the stop token
         info_update: dict[str, Any] = {

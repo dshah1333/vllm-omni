@@ -43,6 +43,7 @@ _PRIVATE_KEYS = frozenset(
         "nvc_function_sotc_id",
         "nvc_function_eotc_id",
         "nvc_function_eotr_id",
+        "nvc_max_model_len",
         "nvc_tokenizer_ref",
         "nvc_tools_signature",
     }
@@ -239,6 +240,10 @@ class NemotronVoiceChatServingRuntimeAdapter:
         tools, tools_signature = _normalized_tools(config)
         rendered_prompt = _render_tool_prompt(instructions, tools)
         runtime, tokenizer = await asyncio.to_thread(_tokenize_runtime, model_config, rendered_prompt)
+        max_model_len = getattr(model_config, "max_model_len", None)
+        if not isinstance(max_model_len, int) or max_model_len <= 0:
+            raise ServingRuntimeConfigError("Nemotron VoiceChat requires a positive Stage-0 max_model_len")
+        runtime["nvc_max_model_len"] = max_model_len
         # Keep raw session values for immutable-in-incarnation update checks;
         # only the rendered prompt token ids enter Stage-0 KV.
         runtime["instructions"] = instructions

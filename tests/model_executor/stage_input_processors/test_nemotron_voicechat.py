@@ -724,7 +724,7 @@ def test_code2wav_accepts_tensor_streaming_flag() -> None:
     assert output.multimodal_outputs["model_outputs"][0].shape == (4,)
 
 
-def test_talker_drains_all_received_positions_per_wake() -> None:
+def test_talker_duplex_drains_each_wake_and_keeps_cumulative_code_history() -> None:
     """P2: chunk 0's PAD prompt region must not cost one upstream chunk per step,
     and P1: a coalesced chunk (2+ new positions, 1 wake) must be fully drained."""
     talker = _bare_talker()
@@ -733,6 +733,7 @@ def test_talker_drains_all_received_positions_per_wake() -> None:
 
     # Prefill wake: chunk 0 carries only the PAD prompt region.
     info = _async_info([pad] * prompt_len, prompt_len, finished=False)
+    info["additional_information"]["meta"]["codec_streaming"] = True
     talker.preprocess(ids, None, _omni_is_prefill=True, **info)
     session = talker._sessions["req-0"]
     assert session["step"] == 1 and not session["sync_mode"]

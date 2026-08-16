@@ -76,6 +76,24 @@ async def test_control_event_does_not_overtake_earlier_audio_input():
 
 
 @pytest.mark.asyncio
+async def test_cancelling_response_bound_append_clears_cancelled_wire_tail():
+    actor = DuplexWebSocketActor(FakeWebSocket())
+    append_task = asyncio.create_task(asyncio.Event().wait())
+    actor.native_append_tail = append_task
+    actor.track_append_task(
+        append_task,
+        epoch=0,
+        mode="append_audio_chunk",
+        final=True,
+        response_bound=True,
+    )
+
+    assert await actor.cancel_append_tasks(response_bound_only=True) is True
+    assert append_task.cancelled()
+    assert actor.native_append_tail is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("event_type", ["input.cancel", "session.close", "close_session"])
 async def test_terminal_control_preserves_wire_order(event_type: str):
     actor = DuplexWebSocketActor(FakeWebSocket())

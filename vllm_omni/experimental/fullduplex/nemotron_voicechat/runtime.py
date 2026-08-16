@@ -30,6 +30,16 @@ def _plain_token_ids(value: object, *, name: str) -> list[int]:
         raise ValueError(f"Nemotron VoiceChat {name} must contain token ids") from exc
 
 
+def _positive_int(value: object, *, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Nemotron VoiceChat requires a positive {name}") from exc
+    if parsed <= 0:
+        raise ValueError(f"Nemotron VoiceChat requires a positive {name}")
+    return parsed
+
+
 class NemotronVoiceChatDuplexRuntimeExtension:
     """Append one 80 ms acoustic frame to one resumable thinker request."""
 
@@ -86,6 +96,18 @@ class NemotronVoiceChatDuplexRuntimeExtension:
             runtime_config.get("nvc_prompt_token_ids"),
             name="nvc_prompt_token_ids",
         )
+        max_model_len = _positive_int(
+            runtime_config.get("nvc_max_model_len"),
+            name="nvc_max_model_len",
+        )
+        required_model_len = len(prompt_ids) + seq + 1
+        if required_model_len > max_model_len:
+            raise ValueError(
+                "Nemotron VoiceChat native duplex session exceeds the Stage-0 "
+                f"max_model_len: prompt_tokens={len(prompt_ids)} + input_frames={seq} + "
+                f"sampled_token=1 gives {required_model_len} > {max_model_len}; "
+                "start a new session or raise Stage 0 max_model_len"
+            )
         try:
             pad_id = int(runtime_config["nvc_text_pad_id"])
         except (KeyError, TypeError, ValueError) as exc:
