@@ -18,6 +18,7 @@ from torch import nn
 from torch.distributed.tensor import DeviceMesh, DTensor, Replicate
 
 import vllm_omni.diffusion.offloader.distributed_layerwise_backend as dist_backend_module
+from vllm_omni.diffusion.model_loader.host_weight_cache_utils import file_digest
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     TensorBinding,
@@ -769,6 +770,7 @@ class TestMmapWeightLoading:
             },
             runtime_layout_key="runtime-layout",
             post_load_complete=True,
+            expected_file_digests={str(weight_file): file_digest(weight_file)},
         )
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
@@ -807,6 +809,7 @@ class TestMmapWeightLoading:
             },
             runtime_layout_key="runtime-layout",
             post_load_complete=True,
+            expected_file_digests={str(tmp_path / "missing.safetensors"): "unused"},
         )
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
@@ -823,6 +826,52 @@ class TestMmapWeightLoading:
             backend._load_weights_from_host_weight_cache(pipeline, modules, plan)
 
         assert pipeline.transformer.weight is old_parameter
+
+    def test_host_weight_cache_digest_change_leaves_ordinary_tensors_intact(
+        self,
+        tmp_path,
+        patched_offload_runtime,
+    ):
+        pipeline = nn.Module()
+        pipeline.transformer = nn.Linear(2, 2, bias=False)
+        old_parameter = pipeline.transformer.weight
+        old_value = old_parameter.detach().clone()
+        weight_file = tmp_path / "runtime.safetensors"
+        save_file({"transformer.weight": torch.full((2, 2), 9.0)}, str(weight_file))
+        expected_digest = file_digest(weight_file)
+        with weight_file.open("r+b") as handle:
+            handle.seek(-1, os.SEEK_END)
+            original = handle.read(1)
+            handle.seek(-1, os.SEEK_END)
+            handle.write(bytes([original[0] ^ 0xFF]))
+        plan = HostWeightPlan(
+            backing_kind="host_weight_cache",
+            bindings={
+                "transformer.weight": TensorBinding(
+                    storage_key="transformer.weight",
+                    file_path=str(weight_file),
+                )
+            },
+            runtime_layout_key="runtime-layout",
+            post_load_complete=True,
+            expected_file_digests={str(weight_file): expected_digest},
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+        modules = SimpleNamespace(dits=[pipeline.transformer], dit_names=["transformer"])
+
+        with pytest.raises(RuntimeError, match="changed after loader validation"):
+            backend._load_weights_from_host_weight_cache(pipeline, modules, plan)
+
+        assert pipeline.transformer.weight is old_parameter
+        assert torch.equal(pipeline.transformer.weight, old_value)
 
     def test_runs_model_post_load_hook(self, tmp_path, patched_offload_runtime):
         pipeline = _MmapPostLoadPipeline()
@@ -944,6 +993,7 @@ class TestMmapWeightLoading:
             bindings={name: TensorBinding(storage_key=name, file_path=str(weight_file)) for name in weights},
             runtime_layout_key="runtime-layout",
             post_load_complete=True,
+            expected_file_digests={str(weight_file): file_digest(weight_file)},
         )
         backend = DistributedLayerwiseOffloadBackend(
             OffloadConfig(
@@ -964,6 +1014,78 @@ class TestMmapWeightLoading:
         # post-hook cleanup.
         assert len(cleanup_calls) == 2
         backend.disable()
+
+    def test_host_weight_cache_enable_falls_back_to_ordinary_tensors(
+        self,
+        tmp_path,
+        patched_offload_runtime,
+    ):
+        class Transformer(nn.Module):
+            _layerwise_offload_blocks_attrs = ["blocks"]
+
+            def __init__(self):
+                super().__init__()
+                self.blocks = nn.ModuleList([nn.Linear(2, 2, bias=False) for _ in range(2)])
+
+        class Pipeline(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = Transformer()
+
+        pipeline = Pipeline()
+        weight_file = tmp_path / "runtime.safetensors"
+        weights = {name: torch.full_like(param, 4) for name, param in pipeline.named_parameters()}
+        save_file(weights, str(weight_file))
+        plan = HostWeightPlan(
+            backing_kind="host_weight_cache",
+            bindings={name: TensorBinding(storage_key=name, file_path=str(weight_file)) for name in weights},
+            runtime_layout_key="runtime-layout",
+            post_load_complete=True,
+            expected_file_digests={str(weight_file): "stale-digest"},
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+
+        backend.enable(pipeline)
+
+        assert backend.enabled
+        assert backend.host_weight_plan is None
+        assert not backend._using_mmap
+        assert not backend._using_rank_local_mmap
+        backend.disable()
+
+    def test_disable_synchronizes_allgather_device_work(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        patched_offload_runtime,
+    ):
+        synchronize_calls: list[None] = []
+        monkeypatch.setattr(
+            dist_backend_module.current_omni_platform,
+            "synchronize",
+            lambda: synchronize_calls.append(None),
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dlo_use_allgather=True,
+            ),
+            torch.device("cpu"),
+        )
+        backend.enabled = True
+        backend._using_rank_local_mmap = False
+
+        backend.disable()
+
+        assert synchronize_calls == [None]
 
     def test_host_weight_cache_registration_uses_budget_and_releases_before_mmap(
         self,

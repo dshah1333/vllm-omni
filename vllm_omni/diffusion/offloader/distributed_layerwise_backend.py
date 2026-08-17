@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from itertools import chain
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -28,6 +29,7 @@ from torch import nn
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.hooks import HookRegistry, ModelHook
+from vllm_omni.diffusion.model_loader.host_weight_cache_utils import file_digest
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
 )
@@ -1182,6 +1184,17 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if any(binding.transform is not None for binding in plan.bindings.values()):
             raise RuntimeError("Host weight cache bindings cannot carry deferred checkpoint transforms")
 
+        cache_files = {binding.file_path for binding in plan.bindings.values()}
+        if plan.expected_file_digests is None or set(plan.expected_file_digests) != cache_files:
+            raise RuntimeError("Host weight cache plan does not cover every shard digest")
+        for file_path in sorted(cache_files):
+            try:
+                actual_digest = file_digest(Path(file_path))
+            except OSError as exc:
+                raise RuntimeError(f"Cannot revalidate host weight cache shard {file_path}: {exc}") from exc
+            if actual_digest != plan.expected_file_digests[file_path]:
+                raise RuntimeError(f"Host weight cache shard changed after loader validation: {file_path}")
+
         required_names: set[str] = set()
         for dit_name, dit_module in zip(modules.dit_names, modules.dits):
             required_names.update(f"{dit_name}.{name}" for name, _ in dit_module.named_parameters())
@@ -1663,15 +1676,25 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 if self.config.dlo_use_allgather:
                     raise ValueError("Host weight cache backing is no-AllGather only in the first implementation")
                 self._using_rank_local_mmap = True
-                self._load_weights_from_host_weight_cache(
-                    pipeline,
-                    modules,
-                    self.host_weight_plan,
-                )
-                # Assignments above dropped the model's private tensor
-                # references. Reclaim those allocations before hook setup so
-                # steady-state PSS reflects the shared mmap backing.
-                self._cleanup_after_loading()
+                try:
+                    self._load_weights_from_host_weight_cache(
+                        pipeline,
+                        modules,
+                        self.host_weight_plan,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "DLO host weight cache remapping failed; retaining ordinary host tensors: %s",
+                        exc,
+                    )
+                    self.host_weight_plan = None
+                    self._using_mmap = False
+                    self._using_rank_local_mmap = False
+                else:
+                    # Assignments above dropped the model's private tensor
+                    # references. Reclaim those allocations before hook setup
+                    # so steady-state PSS reflects the shared mmap backing.
+                    self._cleanup_after_loading()
             else:
                 raise ValueError(f"Unsupported DLO host-weight backing: {self.host_weight_plan.backing_kind}")
             if self._using_rank_local_mmap:
@@ -1991,8 +2014,10 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if not self.enabled and not hasattr(self, "_mmap_file_cache"):
             return
 
-        if self._using_rank_local_mmap:
-            current_omni_platform.synchronize()
+        # Copy and communication streams are asynchronous in both AllGather
+        # and no-AllGather modes. Drain all device work before hooks, process
+        # groups, registrations, or mapped storage can be torn down.
+        current_omni_platform.synchronize()
         registration_released = self._release_registered_mmap()
 
         for blocks in self._blocks:

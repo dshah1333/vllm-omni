@@ -11,6 +11,7 @@ later PRs cut consumers over to these classes.
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -640,6 +641,11 @@ class _DiffusionConfigProjection:
         )
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
+
+        if not math.isfinite(self.dlo_host_weight_cache_lock_timeout):
+            raise ValueError("dlo_host_weight_cache_lock_timeout must be finite")
+        if not math.isfinite(self.dlo_host_weight_cache_pin_limit_gib):
+            raise ValueError("dlo_host_weight_cache_pin_limit_gib must be finite")
 
         if self.dlo_host_weight_cache_pin_limit_gib and (
             not self.enable_distributed_layerwise_offload or self.dlo_use_allgather

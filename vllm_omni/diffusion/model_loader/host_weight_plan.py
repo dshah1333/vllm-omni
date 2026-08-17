@@ -42,6 +42,7 @@ class HostWeightPlan:
     planned_source_prefixes: frozenset[str] = frozenset()
     runtime_layout_key: str | None = None
     post_load_complete: bool = False
+    expected_file_digests: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)

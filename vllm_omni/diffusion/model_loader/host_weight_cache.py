@@ -402,6 +402,9 @@ def _validate_entry(
         bindings=bindings,
         runtime_layout_key=cache_key,
         post_load_complete=True,
+        expected_file_digests={
+            str(entry_dir / filename): metadata["sha256"] for filename, metadata in file_manifest.items()
+        },
     )
 
 

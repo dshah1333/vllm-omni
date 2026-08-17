@@ -17,6 +17,8 @@ from vllm_omni.diffusion.model_loader.host_weight_cache import (
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
 
+_SPAWN_TIMEOUT_SECONDS = 120
+
 
 class _LoaderMarker:
     pass
@@ -237,9 +239,11 @@ def test_concurrent_processes_publish_one_immutable_entry(tmp_path):
     processes = [context.Process(target=_multiprocess_builder, args=(str(tmp_path), queue)) for _ in range(2)]
     for process in processes:
         process.start()
-    results = [queue.get(timeout=30) for _ in processes]
+    # Spawn workers import the full vLLM stack before entering the target;
+    # loaded CI hosts can spend more than 30 seconds in that startup path.
+    results = [queue.get(timeout=_SPAWN_TIMEOUT_SECONDS) for _ in processes]
     for process in processes:
-        process.join(timeout=30)
+        process.join(timeout=_SPAWN_TIMEOUT_SECONDS)
 
     assert all(process.exitcode == 0 for process in processes)
     assert all(code is None for code, _, _ in results)
