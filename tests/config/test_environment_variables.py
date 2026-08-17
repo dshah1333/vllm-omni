@@ -108,7 +108,7 @@ def _resolve_environment_name(expression: ast.expr, constants: dict[str, str]) -
         value = expression.value
     elif isinstance(expression, ast.Name):
         value = constants.get(expression.id)
-    return value if value is not None and value.isupper() else None
+    return value or None
 
 
 def _environment_wrapper_parameters(
@@ -167,7 +167,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         EnvironmentVariableCategory.PUBLIC_OMNI: 22,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
         EnvironmentVariableCategory.PLATFORM_EXTERNAL: 26,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 54,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 55,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 20,
         EnvironmentVariableCategory.INTERNAL: 2,
     }
@@ -182,7 +182,7 @@ def test_inventory_matches_reviewed_snapshot_counts():
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 6,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 11,
-        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 5,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 6,
     }
 
 
@@ -237,7 +237,7 @@ def test_model_and_benchmark_inventory_entries_are_still_referenced():
     assert stale_names == set()
 
 
-def test_environment_scanner_covers_indirection_aliases_and_membership():
+def test_environment_scanner_covers_indirection_aliases_membership_and_casing():
     expected_by_path = {
         "metrics/definitions.py": {
             "VLLM_OMNI_BENCH_AUDIO_CHANNELS",
@@ -247,6 +247,7 @@ def test_environment_scanner_covers_indirection_aliases_and_membership():
             "VLLM_VIDEO_ASYNC_CHUNK",
             "VLLM_VIDEO_AUDIO_DELTA_MODE",
         },
+        "model_executor/models/mimo_audio/mimo_audio.py": {"model_stage"},
         "model_executor/models/moss_tts/modeling_moss_tts_local_depth.py": {"MOSS_TTS_DEBUG_STOP"},
         "distributed/ray_utils/utils.py": {"RAY_RAYLET_PID"},
     }
