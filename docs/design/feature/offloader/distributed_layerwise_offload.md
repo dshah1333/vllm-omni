@@ -329,6 +329,15 @@ block's shard is copied to a device buffer and reconstructed with
 `all_gather_into_tensor` on a communication stream while the current block is
 executing.
 
+![AllGather DLO sharded host weights and lockstep reconstruction](../../figures/dlo/dlo_allgather_sharded_host.svg)
+
+The figure uses DP2 with TP2 to expose both parallel dimensions. DLO creates
+one AllGather group across the DP replicas for each TP coordinate; TP0 workers
+reconstruct TP0 blocks together and TP1 workers reconstruct TP1 blocks
+together. Ordinary TP collectives remain inside each DP replica. Unlike the
+no-AllGather runtime-cache path, these persistent pinned host shards are
+process-owned, and every participating rank must follow the same block order.
+
 ```text
 Compute:    [Block N]             [Block N+1]          [Block N+2]
 H2D:                      [shard N+1]           [shard N+2]

@@ -1,0 +1,165 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="850" viewBox="0 0 1280 850" role="img" aria-labelledby="title desc">
+  <title id="title">AllGather DLO sharded host weights and lockstep device reconstruction</title>
+  <desc id="desc">An external orchestrator submits one synchronized wave to a DP2 by TP2 diffusion engine. Each DP replica contains TP0 and TP1 workers with private pinned host shards and two rotating GPU weight slots. DLO AllGather groups connect matching TP coordinates across DP replicas, reconstructing full rank-local blocks on each device in lockstep. Ordinary TP groups remain within each DP replica.</desc>
+  <defs>
+    <marker id="request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="h2d-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d97706"/>
+    </marker>
+    <marker id="collective-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <style>
+      .canvas { fill: #ffffff; stroke: #e2e8f0; }
+      .node { fill: #f8fafc; stroke: #cbd5e1; }
+      .engine { fill: #ffffff; stroke: #cbd5e1; }
+      .replica { fill: #f8fafc; stroke: #cbd5e1; }
+      .router { fill: #f5f3ff; stroke: #c4b5fd; }
+      .scope { fill: #f8fafc; stroke: #cbd5e1; }
+      .host { fill: #fff7ed; stroke: #fdba74; }
+      .shard { fill: #d97706; }
+      .gpu { fill: #f0fdf4; stroke: #86efac; }
+      .slot-current { fill: #16a34a; }
+      .slot-next { fill: #bbf7d0; stroke: #22c55e; }
+      .lockstep { fill: #f5f3ff; stroke: #c4b5fd; }
+      .title { font: 700 25px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .section { font: 700 15px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1e293b; }
+      .section-sub { font: 500 11.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .eyebrow { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; letter-spacing: .8px; fill: #64748b; }
+      .box-title { font: 700 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1e293b; }
+      .box-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .shard-title { font: 700 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .shard-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .slot-title { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .slot-text { font: 500 9px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .slot-next-title { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #166534; }
+      .slot-next-text { font: 500 9px system-ui, -apple-system, Segoe UI, sans-serif; fill: #166534; }
+      .request-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6d28d9; }
+      .h2d-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b45309; }
+      .collective-label { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6d28d9; }
+      .lock-title { font: 700 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6d28d9; }
+      .lock-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #5b21b6; }
+      .request-path { fill: none; stroke: #7c3aed; stroke-width: 2; marker-end: url(#request-arrow); }
+      .h2d-path { fill: none; stroke: #d97706; stroke-width: 2; marker-end: url(#h2d-arrow); }
+      .collective-path { fill: none; stroke: #7c3aed; stroke-width: 2.5; marker-start: url(#collective-arrow); marker-end: url(#collective-arrow); }
+    </style>
+  </defs>
+
+  <rect x="12" y="12" width="1256" height="826" rx="14" class="canvas"/>
+
+  <text id="title-text" x="40" y="50" class="title">AllGather DLO: sharded host weights, lockstep reconstruction</text>
+  <text x="40" y="74" class="subtitle">DP2 &#215; TP2 shown: DLO groups span DP replicas per TP coordinate; ordinary TP stays within each replica</text>
+
+  <!-- The external control plane submits one synchronized DP wave. -->
+  <rect x="390" y="94" width="500" height="68" rx="10" class="router"/>
+  <text x="640" y="121" text-anchor="middle" class="section">External router / orchestrator</text>
+  <text x="640" y="144" text-anchor="middle" class="section-sub">submits one synchronized DP wave &#183; outside vLLM-Omni DLO</text>
+
+  <rect x="30" y="184" width="1220" height="634" rx="14" class="node"/>
+  <text x="52" y="211" class="eyebrow">ONE NODE &#183; ONE SYNCHRONIZED ENGINE, PROCESS-OWNED HOST SHARDS</text>
+
+  <path d="M 640 162 L 640 232" class="request-path"/>
+  <text x="654" y="202" class="request-label">request wave</text>
+
+  <!-- One engine contains two DP replicas that execute in lockstep. -->
+  <rect x="45" y="232" width="1190" height="262" rx="12" class="engine"/>
+  <text x="68" y="261" class="section">One synchronized diffusion engine &#183; DP2 &#215; TP2</text>
+  <text x="68" y="281" class="section-sub">two DP requests follow the same block order; DLO reuses existing DP groups at each TP coordinate</text>
+
+  <!-- DP replica 0. -->
+  <rect x="65" y="296" width="515" height="186" rx="10" class="replica"/>
+  <text x="82" y="318" class="box-title">DP replica 0 &#183; request 0</text>
+  <text x="563" y="318" text-anchor="end" class="section-sub">ordinary TP group</text>
+
+  <rect x="82" y="332" width="473" height="64" rx="8" class="gpu"/>
+  <text x="98" y="351" class="eyebrow">TP0 &#183; GPU 0</text>
+  <text x="98" y="376" class="box-text">DLO backend &#183; local shard H2D</text>
+  <rect x="250" y="340" width="132" height="44" rx="6" class="slot-current"/>
+  <text x="316" y="357" text-anchor="middle" class="slot-title">SLOT 0 &#183; CURRENT</text>
+  <text x="316" y="374" text-anchor="middle" class="slot-text">full TP-local N &#183; compute</text>
+  <rect x="397" y="340" width="142" height="44" rx="6" class="slot-next"/>
+  <text x="468" y="357" text-anchor="middle" class="slot-next-title">SLOT 1 &#183; PREFETCH</text>
+  <text x="468" y="374" text-anchor="middle" class="slot-next-text">full TP-local N+1 after AG</text>
+
+  <rect x="82" y="410" width="473" height="64" rx="8" class="gpu"/>
+  <text x="98" y="429" class="eyebrow">TP1 &#183; GPU 1</text>
+  <text x="98" y="454" class="box-text">DLO backend &#183; local shard H2D</text>
+  <rect x="250" y="418" width="132" height="44" rx="6" class="slot-current"/>
+  <text x="316" y="435" text-anchor="middle" class="slot-title">SLOT 0 &#183; CURRENT</text>
+  <text x="316" y="452" text-anchor="middle" class="slot-text">full TP-local N &#183; compute</text>
+  <rect x="397" y="418" width="142" height="44" rx="6" class="slot-next"/>
+  <text x="468" y="435" text-anchor="middle" class="slot-next-title">SLOT 1 &#183; PREFETCH</text>
+  <text x="468" y="452" text-anchor="middle" class="slot-next-text">full TP-local N+1 after AG</text>
+
+  <!-- DP replica 1. -->
+  <rect x="700" y="296" width="515" height="186" rx="10" class="replica"/>
+  <text x="717" y="318" class="box-title">DP replica 1 &#183; request 1</text>
+  <text x="1198" y="318" text-anchor="end" class="section-sub">ordinary TP group</text>
+
+  <rect x="725" y="332" width="473" height="64" rx="8" class="gpu"/>
+  <text x="741" y="351" class="eyebrow">TP0 &#183; GPU 2</text>
+  <text x="741" y="376" class="box-text">DLO backend &#183; local shard H2D</text>
+  <rect x="893" y="340" width="132" height="44" rx="6" class="slot-current"/>
+  <text x="959" y="357" text-anchor="middle" class="slot-title">SLOT 0 &#183; CURRENT</text>
+  <text x="959" y="374" text-anchor="middle" class="slot-text">full TP-local N &#183; compute</text>
+  <rect x="1040" y="340" width="142" height="44" rx="6" class="slot-next"/>
+  <text x="1111" y="357" text-anchor="middle" class="slot-next-title">SLOT 1 &#183; PREFETCH</text>
+  <text x="1111" y="374" text-anchor="middle" class="slot-next-text">full TP-local N+1 after AG</text>
+
+  <rect x="725" y="410" width="473" height="64" rx="8" class="gpu"/>
+  <text x="741" y="429" class="eyebrow">TP1 &#183; GPU 3</text>
+  <text x="741" y="454" class="box-text">DLO backend &#183; local shard H2D</text>
+  <rect x="893" y="418" width="132" height="44" rx="6" class="slot-current"/>
+  <text x="959" y="435" text-anchor="middle" class="slot-title">SLOT 0 &#183; CURRENT</text>
+  <text x="959" y="452" text-anchor="middle" class="slot-text">full TP-local N &#183; compute</text>
+  <rect x="1040" y="418" width="142" height="44" rx="6" class="slot-next"/>
+  <text x="1111" y="435" text-anchor="middle" class="slot-next-title">SLOT 1 &#183; PREFETCH</text>
+  <text x="1111" y="452" text-anchor="middle" class="slot-next-text">full TP-local N+1 after AG</text>
+
+  <!-- DLO collectives connect matching TP coordinates across DP replicas. -->
+  <text x="640" y="350" text-anchor="middle" class="collective-label">DLO AG &#183; TP0 GROUP</text>
+  <path d="M 555 364 L 725 364" class="collective-path"/>
+  <text x="640" y="428" text-anchor="middle" class="collective-label">DLO AG &#183; TP1 GROUP</text>
+  <path d="M 555 442 L 725 442" class="collective-path"/>
+
+  <!-- All participants must reach the same collective in the same order. -->
+  <rect x="365" y="516" width="550" height="48" rx="8" class="lockstep"/>
+  <circle cx="395" cy="540" r="12" fill="#7c3aed"/>
+  <text x="395" y="545" text-anchor="middle" font-family="system-ui, sans-serif" font-size="15" font-weight="700" fill="#ffffff">&#8644;</text>
+  <text x="420" y="536" class="lock-title">DLO AllGather requires lockstep block order</text>
+  <text x="420" y="553" class="lock-text">every participant enters each block collective in the same sequence</text>
+
+  <!-- Each replica copies two process-owned host shards before reconstruction. -->
+  <path d="M 455 650 C 412 625, 340 610, 340 575 L 340 540 C 340 516, 318 500, 300 482" class="h2d-path"/>
+  <text x="276" y="618" text-anchor="middle" class="h2d-label">local shard H2D &#215;2</text>
+  <path d="M 825 650 C 868 625, 940 610, 940 575 L 940 540 C 940 516, 962 500, 980 482" class="h2d-path"/>
+  <text x="1004" y="618" text-anchor="middle" class="h2d-label">local shard H2D &#215;2</text>
+
+  <!-- Persistent host shards are private to workers, not mmap-shared. -->
+  <rect x="58" y="650" width="242" height="140" rx="10" class="scope"/>
+  <text x="78" y="676" class="eyebrow">GROUP TOPOLOGY</text>
+  <text x="78" y="702" class="box-title">DP2 &#215; TP2</text>
+  <text x="78" y="725" class="box-text">DLO groups: same TP coordinate</text>
+  <text x="78" y="746" class="box-text">across DP replicas</text>
+  <text x="78" y="767" class="box-text">TP stays the model-parallel group.</text>
+
+  <rect x="330" y="650" width="620" height="140" rx="10" class="host"/>
+  <text x="350" y="676" class="eyebrow">PROCESS-OWNED PINNED HOST SHARDS &#183; NOT RUNTIME-CACHE MMAP</text>
+  <rect x="370" y="692" width="260" height="60" rx="8" class="shard"/>
+  <text x="500" y="716" text-anchor="middle" class="shard-title">DP replica 0 &#183; private</text>
+  <text x="500" y="738" text-anchor="middle" class="shard-text">TP0 shard 0/2 &#183; TP1 shard 0/2</text>
+  <rect x="650" y="692" width="260" height="60" rx="8" class="shard"/>
+  <text x="780" y="716" text-anchor="middle" class="shard-title">DP replica 1 &#183; private</text>
+  <text x="780" y="738" text-anchor="middle" class="shard-text">TP0 shard 1/2 &#183; TP1 shard 1/2</text>
+  <text x="640" y="773" text-anchor="middle" class="box-text">Across each DLO group, shards total approximately one rank-local runtime block copy</text>
+
+  <rect x="980" y="650" width="242" height="140" rx="10" class="scope"/>
+  <text x="1000" y="676" class="eyebrow">HOT PATH &#183; PER WORKER</text>
+  <text x="1000" y="702" class="box-title">Prefetch next block</text>
+  <text x="1000" y="725" class="box-text">local pinned shard &#8594; GPU</text>
+  <text x="1000" y="746" class="box-text">DLO AllGather &#8594; full block</text>
+  <text x="1000" y="767" class="box-text">rotate slots; overlap compute</text>
+</svg>
