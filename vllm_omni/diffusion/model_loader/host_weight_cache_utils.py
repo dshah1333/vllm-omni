@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reusable identity, hashing, and file helpers for the DLO runtime cache."""
+"""Reusable identity, hashing, and file helpers for the DLO host weight cache."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ class RuntimeTensor:
     kind: str
 
 
-class RuntimeCacheError(RuntimeError):
+class HostWeightCacheError(RuntimeError):
     """Expected cache failure that should fall back with a stable code."""
 
     def __init__(self, code: str, message: str):
@@ -102,7 +102,7 @@ def normalize_identity(value: object) -> JsonValue:
         normalized: dict[str, JsonValue] = {}
         for key, item in value.items():
             if not isinstance(key, str):
-                raise IdentityNormalizationError("runtime-cache identity mappings require string keys")
+                raise IdentityNormalizationError("host weight cache identity mappings require string keys")
             normalized[key] = normalize_identity(item)
         return {key: normalized[key] for key in sorted(normalized)}
     if isinstance(value, (set, frozenset)):
@@ -110,7 +110,9 @@ def normalize_identity(value: object) -> JsonValue:
     if isinstance(value, (list, tuple)):
         return [normalize_identity(item) for item in value]
 
-    raise IdentityNormalizationError(f"runtime-cache identity does not support values of type {_type_identity(value)}")
+    raise IdentityNormalizationError(
+        f"host weight cache identity does not support values of type {_type_identity(value)}"
+    )
 
 
 def canonical_json(value: object) -> bytes:
@@ -203,12 +205,12 @@ def exclusive_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
                 break
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                    raise RuntimeCacheError("lock_failed", f"failed to lock {path}: {exc}") from exc
+                    raise HostWeightCacheError("lock_failed", f"failed to lock {path}: {exc}") from exc
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise RuntimeCacheError(
+                    raise HostWeightCacheError(
                         "lock_timeout",
-                        f"timed out after {timeout_seconds:g}s waiting for runtime-cache writer {path.name}",
+                        f"timed out after {timeout_seconds:g}s waiting for host weight cache writer {path.name}",
                     ) from exc
                 time.sleep(min(0.2, remaining))
         try:
@@ -268,7 +270,7 @@ def remove_stale_temps(cache_root: Path, cache_key: str) -> None:
 __all__ = [
     "IdentityNormalizationError",
     "JsonValue",
-    "RuntimeCacheError",
+    "HostWeightCacheError",
     "RuntimeTensor",
     "canonical_json",
     "canonicalize_existing_local_path",

@@ -735,7 +735,7 @@ class _MmapPostLoadPipeline(nn.Module):
 
 
 class TestMmapWeightLoading:
-    def test_runtime_cache_maps_final_weights_without_rerunning_post_load(
+    def test_host_weight_cache_maps_final_weights_without_rerunning_post_load(
         self,
         tmp_path,
         patched_offload_runtime,
@@ -760,7 +760,7 @@ class TestMmapWeightLoading:
         weight_file = tmp_path / "runtime.safetensors"
         save_file({"transformer.proj.weight": torch.full((2, 2), 9.0)}, str(weight_file))
         plan = HostWeightPlan(
-            backing_kind="runtime_cache",
+            backing_kind="host_weight_cache",
             bindings={
                 "transformer.proj.weight": TensorBinding(
                     storage_key="transformer.proj.weight",
@@ -781,7 +781,7 @@ class TestMmapWeightLoading:
         )
         modules = SimpleNamespace(dits=[pipeline.transformer], dit_names=["transformer"])
 
-        backend._load_weights_from_runtime_cache(pipeline, modules, plan)
+        backend._load_weights_from_host_weight_cache(pipeline, modules, plan)
 
         assert pipeline.transformer.post_load_calls == 0
         assert pipeline.transformer.proj.weight is old_parameter
@@ -789,7 +789,7 @@ class TestMmapWeightLoading:
         assert torch.equal(pipeline.transformer.proj.weight, torch.full((2, 2), 9.0))
         backend._release_mmap_handles()
 
-    def test_runtime_cache_mapping_failure_leaves_ordinary_tensors_intact(
+    def test_host_weight_cache_mapping_failure_leaves_ordinary_tensors_intact(
         self,
         tmp_path,
         patched_offload_runtime,
@@ -798,7 +798,7 @@ class TestMmapWeightLoading:
         pipeline.transformer = nn.Linear(2, 2, bias=False)
         old_parameter = pipeline.transformer.weight
         plan = HostWeightPlan(
-            backing_kind="runtime_cache",
+            backing_kind="host_weight_cache",
             bindings={
                 "transformer.weight": TensorBinding(
                     storage_key="transformer.weight",
@@ -820,7 +820,7 @@ class TestMmapWeightLoading:
         modules = SimpleNamespace(dits=[pipeline.transformer], dit_names=["transformer"])
 
         with pytest.raises(Exception, match="missing.safetensors"):
-            backend._load_weights_from_runtime_cache(pipeline, modules, plan)
+            backend._load_weights_from_host_weight_cache(pipeline, modules, plan)
 
         assert pipeline.transformer.weight is old_parameter
 
@@ -918,7 +918,7 @@ class TestMmapWeightLoading:
         assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
         backend.disable()
 
-    def test_runtime_cache_enable_reclaims_private_weights_before_hook_setup(
+    def test_host_weight_cache_enable_reclaims_private_weights_before_hook_setup(
         self,
         tmp_path,
         patched_offload_runtime,
@@ -940,7 +940,7 @@ class TestMmapWeightLoading:
         weight_file = tmp_path / "runtime.safetensors"
         save_file(weights, str(weight_file))
         plan = HostWeightPlan(
-            backing_kind="runtime_cache",
+            backing_kind="host_weight_cache",
             bindings={name: TensorBinding(storage_key=name, file_path=str(weight_file)) for name in weights},
             runtime_layout_key="runtime-layout",
             post_load_complete=True,
@@ -965,7 +965,7 @@ class TestMmapWeightLoading:
         assert len(cleanup_calls) == 2
         backend.disable()
 
-    def test_runtime_cache_registration_uses_budget_and_releases_before_mmap(
+    def test_host_weight_cache_registration_uses_budget_and_releases_before_mmap(
         self,
         monkeypatch: pytest.MonkeyPatch,
         patched_offload_runtime,
@@ -994,14 +994,14 @@ class TestMmapWeightLoading:
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
                 pin_cpu_memory=True,
                 dlo_use_allgather=False,
-                dlo_runtime_cache_pin_limit_gib=1.5,
+                dlo_host_weight_cache_pin_limit_gib=1.5,
             ),
             torch.device("cuda"),
         )
         sources = {"runtime.safetensors": [torch.ones(1)]}
-        backend._runtime_cache_mapped_sources = sources
+        backend._host_weight_cache_mapped_sources = sources
 
-        assert backend._try_register_runtime_cache_mmap()
+        assert backend._try_register_host_weight_cache_mmap()
         assert create_calls == [(sources, int(1.5 * 1024**3))]
 
         backend.enabled = True
@@ -1012,7 +1012,7 @@ class TestMmapWeightLoading:
 
         assert events == ["unregister", "mmap"]
 
-    def test_runtime_cache_registration_falls_back_on_unsupported_platform(
+    def test_host_weight_cache_registration_falls_back_on_unsupported_platform(
         self,
         patched_offload_runtime,
     ):
@@ -1021,13 +1021,13 @@ class TestMmapWeightLoading:
                 strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
                 pin_cpu_memory=True,
                 dlo_use_allgather=False,
-                dlo_runtime_cache_pin_limit_gib=1.0,
+                dlo_host_weight_cache_pin_limit_gib=1.0,
             ),
             torch.device("cpu"),
         )
-        backend._runtime_cache_mapped_sources = {"runtime.safetensors": [torch.ones(1)]}
+        backend._host_weight_cache_mapped_sources = {"runtime.safetensors": [torch.ones(1)]}
 
-        assert not backend._try_register_runtime_cache_mmap()
+        assert not backend._try_register_host_weight_cache_mmap()
         assert backend._host_registration is None
 
 

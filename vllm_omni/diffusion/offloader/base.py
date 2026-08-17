@@ -31,9 +31,9 @@ class OffloadConfig:
     # blocks from the loader-selected host backing with H2D only.
     dlo_use_allgather: bool = True
     dlo_resident_layers: int = 0  # leading DiT layers kept on device
-    # Per-worker budget for registering shared runtime-cache mappings with CUDA.
+    # Per-worker budget for registering shared host weight cache mappings with CUDA.
     # Zero retains bounded host staging.
-    dlo_runtime_cache_pin_limit_gib: float = 0.0
+    dlo_host_weight_cache_pin_limit_gib: float = 0.0
 
     @classmethod
     def from_od_config(cls, od_config: OmniDiffusionConfig) -> "OffloadConfig":
@@ -104,7 +104,7 @@ class OffloadConfig:
         # requirements (concurrent requests, dummy run skip).
         dlo_use_allgather = getattr(od_config, "dlo_use_allgather", True)
         dlo_resident_layers = int(getattr(od_config, "dlo_resident_layers", 0))
-        dlo_runtime_cache_pin_limit_gib = float(getattr(od_config, "dlo_runtime_cache_pin_limit_gib", 0.0))
+        dlo_host_weight_cache_pin_limit_gib = float(getattr(od_config, "dlo_host_weight_cache_pin_limit_gib", 0.0))
         if dlo_resident_layers < 0:
             raise ValueError(f"dlo_resident_layers must be >= 0, got {dlo_resident_layers}")
         if dlo_resident_layers and dlo_use_allgather:
@@ -140,7 +140,7 @@ class OffloadConfig:
             dp_size=dp_size,
             dlo_use_allgather=dlo_use_allgather,
             dlo_resident_layers=dlo_resident_layers,
-            dlo_runtime_cache_pin_limit_gib=dlo_runtime_cache_pin_limit_gib,
+            dlo_host_weight_cache_pin_limit_gib=dlo_host_weight_cache_pin_limit_gib,
         )
 
 

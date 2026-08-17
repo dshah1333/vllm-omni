@@ -10,9 +10,9 @@ import pytest
 import torch
 from torch import nn
 
-from vllm_omni.diffusion.model_loader.runtime_weight_cache import (
-    build_runtime_weight_cache_plan,
-    default_runtime_cache_root,
+from vllm_omni.diffusion.model_loader.host_weight_cache import (
+    build_host_weight_cache_plan,
+    default_host_weight_cache_root,
 )
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -42,7 +42,7 @@ class _Pipeline(nn.Module):
 def test_default_root_is_not_split_by_replica_vllm_cache(monkeypatch):
     monkeypatch.setenv("VLLM_CACHE_ROOT", "/tmp/replica-specific-vllm-cache")
 
-    assert default_runtime_cache_root().endswith("/.cache/vllm-omni/dlo-runtime-weights")
+    assert default_host_weight_cache_root().endswith("/.cache/vllm-omni/dlo-host-weights")
 
 
 def _build(pipeline: nn.Module, cache_root: Path, **overrides):
@@ -67,7 +67,7 @@ def _build(pipeline: nn.Module, cache_root: Path, **overrides):
         "pipeline_parallel_size": 1,
     }
     kwargs.update(overrides)
-    return build_runtime_weight_cache_plan(pipeline, **kwargs)
+    return build_host_weight_cache_plan(pipeline, **kwargs)
 
 
 def _multiprocess_builder(cache_root: str, queue) -> None:
@@ -121,7 +121,7 @@ def test_unstable_loader_identity_fails_closed(tmp_path):
 
     assert result.plan is None
     assert result.fallback_code == "unstable_identity"
-    assert result.fallback_reason == "runtime-cache identity does not support values of type builtins.object"
+    assert result.fallback_reason == "host weight cache identity does not support values of type builtins.object"
     assert list(tmp_path.rglob("*.safetensors")) == []
 
 

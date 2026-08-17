@@ -576,10 +576,10 @@ class _DiffusionConfigProjection:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
-    dlo_enable_runtime_cache: bool = False
-    dlo_runtime_cache_dir: str | None = None
-    dlo_runtime_cache_lock_timeout: float = Field(default=600.0, gt=0)
-    dlo_runtime_cache_pin_limit_gib: float = Field(default=0.0, ge=0)
+    dlo_enable_host_weight_cache: bool = False
+    dlo_host_weight_cache_dir: str | None = None
+    dlo_host_weight_cache_lock_timeout: float = Field(default=600.0, gt=0)
+    dlo_host_weight_cache_pin_limit_gib: float = Field(default=0.0, ge=0)
     dlo_resident_layers: int = Field(default=0, ge=0)
     pin_cpu_memory: bool = True
     diffusion_compile_granularity: Literal["regional", "full"] = "regional"
@@ -642,12 +642,12 @@ class _DiffusionConfigProjection:
         from vllm_omni.diffusion.diffusion_kv.config import parse_diffusion_kv_cache_mode
         from vllm_omni.quantization import build_quant_config
 
-        if self.dlo_enable_runtime_cache and not self.enable_distributed_layerwise_offload:
-            raise ValueError("dlo_enable_runtime_cache requires distributed layerwise offload")
-        if self.dlo_enable_runtime_cache and self.dlo_use_allgather:
-            raise ValueError("dlo_enable_runtime_cache currently requires dlo_use_allgather=False")
-        if self.dlo_runtime_cache_pin_limit_gib and not self.dlo_enable_runtime_cache:
-            raise ValueError("dlo_runtime_cache_pin_limit_gib requires dlo_enable_runtime_cache=True")
+        if self.dlo_enable_host_weight_cache and not self.enable_distributed_layerwise_offload:
+            raise ValueError("dlo_enable_host_weight_cache requires distributed layerwise offload")
+        if self.dlo_enable_host_weight_cache and self.dlo_use_allgather:
+            raise ValueError("dlo_enable_host_weight_cache currently requires dlo_use_allgather=False")
+        if self.dlo_host_weight_cache_pin_limit_gib and not self.dlo_enable_host_weight_cache:
+            raise ValueError("dlo_host_weight_cache_pin_limit_gib requires dlo_enable_host_weight_cache=True")
 
         if self.tf_model_config is None:
             self.tf_model_config = TransformerConfig()

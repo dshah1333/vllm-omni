@@ -20,7 +20,7 @@ DLO weight collective.
 Host storage is selected separately from the transfer protocol. The loader can
 produce a direct-checkpoint mmap plan for a proven-compatible runtime layout;
 otherwise it uses the ordinary loader. In no-AllGather mode, an opt-in Phase B
-runtime cache can normalize those final ordinary-loader DiT tensors into an
+host weight cache can normalize those final ordinary-loader DiT tensors into an
 immutable node-local mmap entry. Consequently, replicas can share either
 proven-compatible checkpoint pages or equivalent final runtime layouts. An
 opt-in host-registration budget can make the complete final mapping directly
@@ -42,7 +42,7 @@ DLO is divided into four planes: configuration, loader-owned host storage,
 backend setup, and the per-block inference hot path. Keeping these decisions
 separate is intentional. In particular, an mmap cache is a host-storage choice;
 it does not imply a DLO AllGather, and disabling DLO AllGather does not decide
-whether the host source is private memory, checkpoint mmap, or runtime-cache
+whether the host source is private memory, checkpoint mmap, or host weight cache
 mmap. The shared control plane is described once below; the AllGather and
 no-AllGather startup and hot paths are then shown separately.
 
@@ -60,14 +60,14 @@ flowchart TB
         Loader["DiffusersPipelineLoader"]
         Checkpoint["checkpoint mmap preflight"]
         Ordinary["ordinary load + callbacks + calibration"]
-        RuntimeCache["runtime_weight_cache<br/>final-layout publication / join"]
+        HostWeightCache["host_weight_cache<br/>final-layout publication / join"]
         Contract["HostWeightPlan<br/>backing + bindings + transforms"]
         Loader --> Checkpoint
         Loader -->|"registered final layout requested"| Ordinary
         Checkpoint -->|"compatible"| Contract
         Checkpoint -->|"fallback"| Ordinary
-        Ordinary -->|"runtime cache enabled"| RuntimeCache
-        RuntimeCache -->|"enabled and compatible"| Contract
+        Ordinary -->|"host weight cache enabled"| HostWeightCache
+        HostWeightCache -->|"enabled and compatible"| Contract
     end
 
     Runner -->|"load_model"| Loader
@@ -80,7 +80,7 @@ flowchart TB
     Discovery["ModuleDiscovery + optional OffloadPlan"] --> Backend
     Contract -.->|"passed once by the runner"| Backend
 
-    Backend -.->|"runtime cache + positive budget"| Registration["host_registration<br/>platform-neutral lifecycle"]
+    Backend -.->|"host weight cache + positive budget"| Registration["host_registration<br/>platform-neutral lifecycle"]
     Registration --> CUDA["CUDA registration backend"]
     Backend --> Hooks["DistributedLayerwiseOffloadHook<br/>one circular hook per streamed block"]
     Forward["pipeline.forward"] --> Hooks
@@ -94,8 +94,8 @@ flowchart TB
 | CLI, engine arguments, and `OmniDiffusionConfig` | User policy, defaults, validation, and propagation to every worker | Checkpoint inspection, cache publication, or buffer allocation |
 | `OffloadConfig.from_od_config()` | Offload-strategy selection, effective DLO group size, AllGather policy, resident-layer count, and registration budget | Host-weight compatibility decisions |
 | `DiffusersPipelineLoader` | Ordinary loading lifecycle and the decision to return an optional `HostWeightPlan` | DLO process groups or block-stream scheduling |
-| Checkpoint mmap planner | Proving that checkpoint tensors can represent the required runtime layout before ordinary DiT materialization is skipped | Runtime-cache identity or transfer policy |
-| `runtime_weight_cache` | Normalizing final ordinary-loader tensors into an immutable node-local entry and returning a validated plan | Model mutation, host registration, H2D, or collectives |
+| Checkpoint mmap planner | Proving that checkpoint tensors can represent the required runtime layout before ordinary DiT materialization is skipped | Host weight cache identity or transfer policy |
+| `host_weight_cache` | Normalizing final ordinary-loader tensors into an immutable node-local entry and returning a validated plan | Model mutation, host registration, H2D, or collectives |
 | `HostWeightPlan` | The one-way loader-to-offloader contract: backing kind, tensor bindings, source coverage, and any bounded transforms | Cache construction or runtime scheduling |
 | `ModuleDiscovery` and model `OffloadPlan` | Discovering DiT/components and declaring block, resident, and on-demand paths | Loader or cache behavior embedded in model pipelines |
 | `DistributedLayerwiseOffloadBackend` | Consuming the exact plan, selecting the existing group, mapping/repointing storage, allocating shared buffers and streams, optional host registration, installing hooks, and cleanup | Re-running loader compatibility checks or orchestrating replicas |
@@ -104,14 +104,14 @@ flowchart TB
 | `DiffusionWorker` | Calling backend teardown before destroying the distributed environment | Managing backend-owned mappings or registrations directly |
 
 The configuration fields are routed to the component that can enforce their
-contract. `dlo_enable_runtime_cache`, its cache root, and lock timeout are
-consumed by the loader. `dlo_runtime_cache_pin_limit_gib` is also visible while
-loading because a positive value deliberately selects the transform-complete
-runtime cache; the backend later consumes the same budget for registration.
-`dlo_use_allgather` controls loader plan routing because the runtime cache is
-no-AllGather-only, and it selects the backend transfer protocol. This is
-coordination through typed configuration and `HostWeightPlan`, not through
-model-specific global state.
+contract. `dlo_enable_host_weight_cache`, its cache root, and lock timeout are
+consumed by the loader. `dlo_host_weight_cache_pin_limit_gib` is also visible
+while loading because a positive value deliberately selects the
+transform-complete host weight cache; the backend later consumes the same
+budget for registration. `dlo_use_allgather` controls loader plan routing
+because the host weight cache is no-AllGather-only, and it selects the backend
+transfer protocol. This is coordination through typed configuration and
+`HostWeightPlan`, not through model-specific global state.
 
 ### Shared startup and lifecycle
 
@@ -138,9 +138,9 @@ sequenceDiagram
 ```
 
 The loader returns a plan only after its contract is valid: checkpoint plans
-have preflight-proven source coverage and metadata, while runtime-cache plans
-also have full manifest, file, and mapped-content validation. The runner then
-transfers ownership exactly once with
+have preflight-proven source coverage and metadata, while host weight cache
+plans also have full manifest, file, and mapped-content validation. The runner
+then transfers ownership exactly once with
 `model_loader.take_host_weight_plan()`. If no plan is returned, the backend
 requires materialized ordinary-loader tensors. If a plan caused ordinary DiT
 materialization to be skipped, failure to create or enable its consumer is a
@@ -182,7 +182,7 @@ uses rank-local transfer.
 ```mermaid
 sequenceDiagram
     participant L as DiffusersPipelineLoader
-    participant C as runtime_weight_cache
+    participant C as host_weight_cache
     participant B as DLO backend
     participant P as platform registration
     participant H as block hooks
@@ -192,20 +192,20 @@ sequenceDiagram
         L-->>B: checkpoint plan via runner
     else ordinary loading
         L->>L: load, mutate, validate, and calibrate final tensors
-        opt runtime cache enabled
+        opt host weight cache enabled
             L->>C: publish or join final-layout entry
-            C-->>L: validated runtime-cache plan or fail-closed fallback
+            C-->>L: validated host weight cache plan or fail-closed fallback
         end
         L-->>B: plan or materialized tensors via runner
     end
     B->>B: consume complete rank-local block sources
-    opt runtime-cache plan and positive registration budget
+    opt host weight cache plan and positive registration budget
         B->>P: register the complete immutable mapping
         P-->>B: direct-H2D source or bounded-staging fallback
     end
     B->>H: install hooks and prime the first block
     loop each streamed block
-        alt registered runtime-cache mapping
+        alt registered host weight cache mapping
             H->>H: copy complete next block directly to device
         else pageable mmap mapping
             H->>H: pack into a pinned staging slot, then copy to device
@@ -228,13 +228,13 @@ the source of the complete-block H2D copy.
 | Ordinary runtime tensors | AllGather group larger than one | Each rank retains a pinned local weight shard | shard H2D → DLO AllGather → device slot |
 | Checkpoint mmap | AllGather group larger than one | Each rank prepares its persistent shard, then releases the source mapping | shard H2D → DLO AllGather → device slot |
 | Ordinary runtime tensors | Rank-local / no-AllGather | Each rank retains the complete loader-produced local layout | complete-block H2D → device slot |
-| Checkpoint or runtime-cache mmap, zero registration budget | Rank-local / no-AllGather | Immutable mapping plus two bounded pinned host-staging slots | mmap views → pinned staging slot → device slot |
-| Runtime-cache mmap, positive registration budget | Rank-local / no-AllGather | Complete mapping is registered by the platform backend | registered mmap views → device slot |
+| Checkpoint or host weight cache mmap, zero registration budget | Rank-local / no-AllGather | Immutable mapping plus two bounded pinned host-staging slots | mmap views → pinned staging slot → device slot |
+| Host weight cache mmap, positive registration budget | Rank-local / no-AllGather | Complete mapping is registered by the platform backend | registered mmap views → device slot |
 
 The three axes therefore remain independent:
 
 1. **Offload policy:** whether DLO is enabled and which layers are resident.
-2. **Host backing:** ordinary tensors, checkpoint mmap, or final runtime-cache
+2. **Host backing:** ordinary tensors, checkpoint mmap, or final host weight cache
    mmap, selected by the loader.
 3. **Transfer protocol:** rank-local H2D or H2D plus DLO AllGather, selected by
    the backend from validated configuration and existing topology.
@@ -244,8 +244,8 @@ The three axes therefore remain independent:
 - Invalid option combinations fail during configuration validation.
 - Checkpoint mmap preflight failure falls back before ordinary loading is
   skipped.
-- Runtime-cache incompatibility, timeout, or publication failure retains the
-  already-valid ordinary tensors.
+- Host weight cache incompatibility, timeout, or publication failure retains
+  the already-valid ordinary tensors.
 - Host-registration failure rolls back and retains bounded staging. A rollback
   failure aborts startup because unmapping a range still owned by the platform
   would be unsafe.
@@ -321,7 +321,7 @@ parameter-sharding lifecycle and cannot be sharded a second time by DLO.
 
 The loader may provide ordinary runtime tensors or a compatible checkpoint
 plan. During backend setup, either source is normalized into persistent local
-shards. The final-layout runtime cache is not selected in AllGather mode.
+shards. The final-layout host weight cache is not selected in AllGather mode.
 
 With the default `dlo_use_allgather=True`, each rank stores approximately
 `1 / group_size` of each streamable block in pinned host memory. The next
@@ -335,7 +335,7 @@ The figure uses DP2 with TP2 to expose both parallel dimensions. DLO creates
 one AllGather group across the DP replicas for each TP coordinate; TP0 workers
 reconstruct TP0 blocks together and TP1 workers reconstruct TP1 blocks
 together. Ordinary TP collectives remain inside each DP replica. Unlike the
-no-AllGather runtime-cache path, these persistent pinned host shards are
+no-AllGather host weight cache path, these persistent pinned host shards are
 process-owned, and every participating rank must follow the same block order.
 
 ```text
@@ -374,7 +374,7 @@ domains.
 
 With `--dlo-no-use-allgather`, DLO forces its internal offload shard size to
 one and streams complete blocks using H2D copies only. The host backing may be
-a loader-approved checkpoint mapping, a normalized runtime-cache mapping, or
+a loader-approved checkpoint mapping, a normalized host weight cache mapping, or
 ordinary runtime tensors.
 
 ![No-AllGather DLO shared host weights and independent runtime orchestration](../../figures/dlo/dlo_no_allgather_shared_host.svg)
@@ -394,13 +394,13 @@ the persistent private full-model copy per pure-DP process, but each process
 still packs and transfers every complete block. Sharing is node-local; each
 node has its own page cache.
 
-For a runtime-cache mapping, a positive registration budget replaces those
+For a host weight cache mapping, a positive registration budget replaces those
 host slots with direct copies from the shared final tensor views. A zero budget
 or failed registration retains the bounded staging behavior.
 
 When direct mmap preflight fails, the regular model loader remains responsible
 for preparing each rank's weights, including TP-local tensors or HSDP-managed
-parameters. Supported CPU layouts may then enter the opt-in runtime cache.
+parameters. Supported CPU layouts may then enter the opt-in host weight cache.
 Unsupported layouts keep one private runtime copy per process.
 
 This mode means:
@@ -412,11 +412,11 @@ This mode means:
 - TP/HSDP/SP collectives, if configured, are not disabled by this flag; only
   DLO's additional weight AllGather is disabled.
 - Pure DP deployments share one checkpoint-backed copy per node when direct
-  mmap is selected. The runtime cache can share equivalent ordinary-loader
+  mmap is selected. The host weight cache can share equivalent ordinary-loader
   outputs; its fallback keeps one private runtime copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
 
-### Post-load runtime cache
+### Post-load host weight cache
 
 The Phase B cache preserves the same ownership boundary. DLO neither derives
 cache keys nor interprets model loaders. When enabled with no-AllGather, every
@@ -428,7 +428,7 @@ processing, strict validation, and calibration. The loader then:
    ambiguous layouts before changing the model;
 3. hashes tensor names, metadata, and final bytes;
 4. builds or joins one content-addressed entry under a strict POSIX lock; and
-5. returns a `HostWeightPlan(backing_kind="runtime_cache")` only after file,
+5. returns a `HostWeightPlan(backing_kind="host_weight_cache")` only after file,
    manifest, and remapped-tensor content validation succeeds.
 
 The identity excludes DP size/rank and SP rank. It includes TP world size/rank
@@ -463,15 +463,16 @@ still performs ordinary loading plus full content-hash passes in every rank.
 Skip-load-on-hit is a separate follow-up after loader side effects can be
 modeled safely.
 
-### Registered runtime-cache transfer
+### Registered host weight cache transfer
 
-`dlo_runtime_cache_pin_limit_gib > 0` opts a worker into complete runtime-cache
-registration when its platform supports it. It also changes loader selection:
-no-AllGather uses the ordinary loader and final runtime cache even when a TP1
-direct-checkpoint plan is available. A checkpoint binding can carry a deferred
-adapter such as grouped-QKV reordering. Registering that raw source would not
-remove the adapter's recurrent CPU allocation/copy, whereas the runtime cache
-contains the transform-complete final tensors.
+`dlo_host_weight_cache_pin_limit_gib > 0` opts a worker into registration of
+the complete host weight cache mapping when its platform supports it. It also
+changes loader selection: no-AllGather uses the ordinary loader and
+final-layout host weight cache even when a TP1 direct-checkpoint plan is
+available. A checkpoint binding can carry a deferred adapter such as
+grouped-QKV reordering. Registering that raw source would not remove the
+adapter's recurrent CPU allocation/copy, whereas the host weight cache contains
+the transform-complete final tensors.
 
 After mapping and validating every final tensor, DLO groups source storages by
 backing file, page-aligns their address ranges, and coalesces overlapping or
@@ -503,10 +504,10 @@ destroying the distributed environment and platform context.
 
 | Parallelism | DLO + AllGather | DLO without AllGather |
 |---|---|---|
-| **DP** | Supported primary path. DLO shards host weights across the DP group and can run DP multi-concurrency. | Supported rank-local path. Compatible TP1 replicas can share checkpoint pages; the optional runtime cache shares equivalent final layouts while excluding DP rank from its identity. CUDA workers may register the complete final mapping for direct H2D. |
-| **SP** | Supported in the implementation. With DP=1, DLO uses the SP group for host-weight sharding; SP still shards sequence/activation work. | SP remains active without a DLO weight collective. Runtime-cache v1 excludes SP rank and includes conservative SP implementation/world-size guards. Registered transfer does not remove ordinary SP activation/attention collectives. |
-| **TP > 1** | Outside the Phase A direct-mmap scope. The loader preserves TP-local layouts and DLO may apply DP/SP host sharding to ordinary runtime tensors. | The ordinary TP-aware loader produces rank-local tensors. Runtime-cache v1 creates one entry per TP coordinate, shareable by equivalent DP/SP processes. Registering those final mappings avoids the recurrent staging copy but does not remove ordinary TP collectives. |
-| **HSDP** | Rejected. HSDP has already sharded parameters, so DLO AllGather would double-shard them. | Accepted only with ordinary-loader rank-local tensors. HSDP owns parameter sharding and its own gathers; runtime-cache v1 rejects HSDP/DTensor layouts. |
+| **DP** | Supported primary path. DLO shards host weights across the DP group and can run DP multi-concurrency. | Supported rank-local path. Compatible TP1 replicas can share checkpoint pages; the optional host weight cache shares equivalent final layouts while excluding DP rank from its identity. CUDA workers may register the complete final mapping for direct H2D. |
+| **SP** | Supported in the implementation. With DP=1, DLO uses the SP group for host-weight sharding; SP still shards sequence/activation work. | SP remains active without a DLO weight collective. Host weight cache v1 excludes SP rank and includes conservative SP implementation/world-size guards. Registered transfer does not remove ordinary SP activation/attention collectives. |
+| **TP > 1** | Outside the Phase A direct-mmap scope. The loader preserves TP-local layouts and DLO may apply DP/SP host sharding to ordinary runtime tensors. | The ordinary TP-aware loader produces rank-local tensors. Host weight cache v1 creates one entry per TP coordinate, shareable by equivalent DP/SP processes. Registering those final mappings avoids the recurrent staging copy but does not remove ordinary TP collectives. |
+| **HSDP** | Rejected. HSDP has already sharded parameters, so DLO AllGather would double-shard them. | Accepted only with ordinary-loader rank-local tensors. HSDP owns parameter sharding and its own gathers; host weight cache v1 rejects HSDP/DTensor layouts. |
 
 ### Combined dimensions
 
@@ -538,7 +539,7 @@ Online quantization remains incompatible with DLO AllGather; use
 ### No-AllGather constraints
 
 The no-AllGather path does not impose these DLO-specific synchronized-wave
-requirements. Runtime-cache v1 is no-AllGather only and rejects all
+requirements. Host weight cache v1 is no-AllGather only and rejects all
 quantization configurations, HSDP/DTensor, expert parallelism, CFG
 parallelism, PP, non-contiguous tensors, and tied/shared storage.
 
@@ -570,8 +571,8 @@ artifacts before making hardware or performance claims. Track that work in
 
 - Use **no-AllGather** when independent replica execution is required. TP1
   direct-mmap deployments can share checkpoint pages per node. Enable the
-  runtime cache only when independent replicas have repeated final layouts and
-  benchmark the target CPU/memory topology, especially for matching
+  host weight cache only when independent replicas have repeated final layouts
+  and benchmark the target CPU/memory topology, especially for matching
   coordinates across multiple TP engines. On CUDA, provide an explicit
   registration budget large enough for the complete final layout when
   recurrent staging cost is unacceptable; leave it at zero when page-locking
@@ -579,5 +580,5 @@ artifacts before making hardware or performance claims. Track that work in
 
 ### HSDP
 
-- Do not combine HSDP with DLO AllGather or runtime-cache v1. HSDP with
+- Do not combine HSDP with DLO AllGather or host weight cache v1. HSDP with
   no-AllGather remains an ordinary-loader rank-local path.

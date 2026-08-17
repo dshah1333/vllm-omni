@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="850" viewBox="0 0 1280 850" role="img" aria-labelledby="title desc">
   <title id="title">No-AllGather DLO shared host weights and independent runtime orchestration</title>
-  <desc id="desc">An external orchestrator routes requests to two independently scheduled TP2 diffusion engines on one node. Each engine contains two rank-local workers and devices, with private loaders, mmap views, DLO runtime hooks, streams, events, and rotating GPU slots. Equivalent TP0 workers across engines map one immutable TP0 runtime-cache payload, while equivalent TP1 workers map a separate TP1 payload, without a cross-engine DLO AllGather.</desc>
+  <desc id="desc">An external orchestrator routes requests to two independently scheduled TP2 diffusion engines on one node. Each engine contains two rank-local workers and devices, with private loaders, mmap views, DLO runtime hooks, streams, events, and rotating GPU slots. Equivalent TP0 workers across engines map one immutable TP0 entry in the host weight cache, while equivalent TP1 workers map a separate TP1 entry, without a cross-engine DLO AllGather.</desc>
   <defs>
     <marker id="request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
@@ -184,7 +184,7 @@
   <text x="78" y="767" class="box-text">A/TP1 + B/TP1 &#8594; TP1 entry</text>
 
   <rect x="330" y="650" width="620" height="140" rx="10" class="cache"/>
-  <text x="350" y="676" class="eyebrow">NODE-LOCAL IMMUTABLE RUNTIME CACHE &#183; ONE COPY PER TP COORDINATE</text>
+  <text x="350" y="676" class="eyebrow">NODE-LOCAL IMMUTABLE HOST WEIGHT CACHE &#183; ONE COPY PER TP COORDINATE</text>
   <rect x="370" y="692" width="260" height="60" rx="8" class="payload"/>
   <text x="500" y="717" text-anchor="middle" class="payload-title">TP0 physical payload</text>
   <text x="500" y="738" text-anchor="middle" class="payload-text">shared by A/TP0 + B/TP0</text>

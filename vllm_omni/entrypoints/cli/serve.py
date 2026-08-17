@@ -723,7 +723,7 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--dlo-enable-runtime-cache",
+            "--dlo-enable-host-weight-cache",
             action="store_true",
             help=(
                 "After ordinary loading, publish or join a node-local mmap cache "
@@ -732,11 +732,11 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--dlo-runtime-cache-pin-limit-gib",
+            "--dlo-host-weight-cache-pin-limit-gib",
             type=float,
             default=0.0,
             help=(
-                "Maximum GiB of read-only runtime-cache mappings each worker may "
+                "Maximum GiB of read-only host weight cache mappings each worker may "
                 "register for direct H2D when the platform supports it. Zero keeps "
                 "bounded pinned staging."
             ),

@@ -147,7 +147,7 @@
   <text x="78" y="767" class="box-text">TP stays the model-parallel group.</text>
 
   <rect x="330" y="650" width="620" height="140" rx="10" class="host"/>
-  <text x="350" y="676" class="eyebrow">PROCESS-OWNED PINNED HOST SHARDS &#183; NOT RUNTIME-CACHE MMAP</text>
+  <text x="350" y="676" class="eyebrow">PROCESS-OWNED PINNED HOST SHARDS &#183; NOT HOST WEIGHT CACHE MMAP</text>
   <rect x="370" y="692" width="260" height="60" rx="8" class="shard"/>
   <text x="500" y="716" text-anchor="middle" class="shard-title">DP replica 0 &#183; private</text>
   <text x="500" y="738" text-anchor="middle" class="shard-text">TP0 shard 0/2 &#183; TP1 shard 0/2</text>

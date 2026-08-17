@@ -441,16 +441,16 @@ class DiffusersPipelineLoader:
                 _dp_size = int(getattr(self.parallel_config, "data_parallel_size", 1))
                 _sp_size = int(getattr(self.parallel_config, "sequence_parallel_size", 1))
                 _dlo_group_size = _dp_size if _dp_size > 1 else _sp_size
-                _prefer_registered_runtime_cache = (
+                _prefer_registered_host_weight_cache = (
                     _dist_offload
                     and not _use_ag
-                    and bool(getattr(self.od_config, "dlo_enable_runtime_cache", False))
-                    and float(getattr(self.od_config, "dlo_runtime_cache_pin_limit_gib", 0.0)) > 0
+                    and bool(getattr(self.od_config, "dlo_enable_host_weight_cache", False))
+                    and float(getattr(self.od_config, "dlo_host_weight_cache_pin_limit_gib", 0.0)) > 0
                 )
 
                 plan_result = None
                 weight_sources = self._get_weight_sources(model)
-                if _dist_offload and not _prefer_registered_runtime_cache:
+                if _dist_offload and not _prefer_registered_host_weight_cache:
                     modules = ModuleDiscovery.discover(model)
                     plan_result = build_checkpoint_mmap_plan(
                         model,
@@ -462,14 +462,14 @@ class DiffusersPipelineLoader:
                         online_quantization=_has_online_quant,
                     )
                     self.host_weight_plan = plan_result.plan
-                elif _prefer_registered_runtime_cache:
+                elif _prefer_registered_host_weight_cache:
                     # Direct checkpoint bindings can carry deferred transforms
                     # (for example grouped-QKV reordering), so registering the
                     # raw checkpoint mapping would not make every recurrent H2D
                     # source directly copyable. Materialize once, apply every
                     # post-load mutation, then publish/register the final layout.
                     logger.info(
-                        "DLO runtime-cache registration requested; using the ordinary loader "
+                        "DLO host weight cache registration requested; using the ordinary loader "
                         "once to publish a transform-complete final mmap layout"
                     )
 
@@ -535,19 +535,19 @@ class DiffusersPipelineLoader:
 
         self._apply_skip_softmax_calibration(model)
         model.eval()
-        self._maybe_build_runtime_weight_cache(model, load_format)
+        self._maybe_build_host_weight_cache(model, load_format)
         return model
 
-    def _maybe_build_runtime_weight_cache(self, model: nn.Module, load_format: str) -> None:
+    def _maybe_build_host_weight_cache(self, model: nn.Module, load_format: str) -> None:
         """Publish final ordinary-loader DiT tensors for no-AllGather DLO."""
         if self.host_weight_plan is not None:
             return
         if not getattr(self.od_config, "enable_distributed_layerwise_offload", False):
             return
-        if not getattr(self.od_config, "dlo_enable_runtime_cache", False):
+        if not getattr(self.od_config, "dlo_enable_host_weight_cache", False):
             return
         if getattr(self.od_config, "dlo_use_allgather", True):
-            logger.info("DLO runtime cache is no-AllGather only; leaving AllGather storage unchanged")
+            logger.info("DLO host weight cache is no-AllGather only; leaving AllGather storage unchanged")
             return
 
         parallel_config = self.parallel_config
@@ -560,17 +560,18 @@ class DiffusersPipelineLoader:
                 tp_rank = int(get_tensor_model_parallel_rank())
             except Exception as exc:
                 logger.warning(
-                    "DLO runtime cache unavailable [parallel_rank_unavailable]: cannot resolve TP rank for TP=%d: %s",
+                    "DLO host weight cache unavailable [parallel_rank_unavailable]: "
+                    "cannot resolve TP rank for TP=%d: %s",
                     tp_size,
                     exc,
                 )
                 return
 
         modules = ModuleDiscovery.discover(model)
-        from vllm_omni.diffusion.model_loader.runtime_weight_cache import (
+        from vllm_omni.diffusion.model_loader.host_weight_cache import (
             DEFAULT_LOCK_TIMEOUT_SECONDS,
             DEFAULT_SHARD_SIZE_BYTES,
-            build_runtime_weight_cache_plan,
+            build_host_weight_cache_plan,
         )
 
         loader_inputs = {
@@ -597,13 +598,13 @@ class DiffusersPipelineLoader:
             for module in model.modules()
         ):
             runtime_quantization = "module_quant_method"
-        result = build_runtime_weight_cache_plan(
+        result = build_host_weight_cache_plan(
             model,
             dit_modules=tuple(zip(modules.dit_names, modules.dits)),
             loader_type=type(self),
-            cache_root=getattr(self.od_config, "dlo_runtime_cache_dir", None),
+            cache_root=getattr(self.od_config, "dlo_host_weight_cache_dir", None),
             lock_timeout_seconds=float(
-                getattr(self.od_config, "dlo_runtime_cache_lock_timeout", DEFAULT_LOCK_TIMEOUT_SECONDS)
+                getattr(self.od_config, "dlo_host_weight_cache_lock_timeout", DEFAULT_LOCK_TIMEOUT_SECONDS)
             ),
             max_shard_bytes=DEFAULT_SHARD_SIZE_BYTES,
             model_identity=str(model_identity) if model_identity is not None else None,
@@ -623,7 +624,7 @@ class DiffusersPipelineLoader:
         if result.plan is not None:
             self.host_weight_plan = result.plan
             logger.info(
-                "DLO runtime cache selected (layout=%s, TP=%d/%d, SP=%d)",
+                "DLO host weight cache selected (layout=%s, TP=%d/%d, SP=%d)",
                 result.plan.runtime_layout_key[:12] if result.plan.runtime_layout_key else "unknown",
                 tp_rank,
                 tp_size,
@@ -631,7 +632,7 @@ class DiffusersPipelineLoader:
             )
         else:
             logger.warning(
-                "DLO runtime cache unavailable [%s]; retaining ordinary host tensors: %s",
+                "DLO host weight cache unavailable [%s]; retaining ordinary host tensors: %s",
                 result.fallback_code or "unknown",
                 result.fallback_reason or "unspecified reason",
             )

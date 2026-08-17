@@ -395,9 +395,9 @@ def test_dlo_plan_fallback_runs_ordinary_loader(monkeypatch):
     assert loader.take_host_weight_plan() is None
 
 
-def test_dlo_runtime_cache_is_built_after_final_post_load_mutation(monkeypatch, tmp_path):
+def test_dlo_host_weight_cache_is_built_after_final_post_load_mutation(monkeypatch, tmp_path):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
-    import vllm_omni.diffusion.model_loader.runtime_weight_cache as cache_mod
+    import vllm_omni.diffusion.model_loader.host_weight_cache as cache_mod
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -416,9 +416,9 @@ def test_dlo_runtime_cache_is_built_after_final_post_load_mutation(monkeypatch, 
         quantization_config=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
-        dlo_enable_runtime_cache=True,
-        dlo_runtime_cache_dir=str(tmp_path),
-        dlo_runtime_cache_lock_timeout=1.0,
+        dlo_enable_host_weight_cache=True,
+        dlo_host_weight_cache_dir=str(tmp_path),
+        dlo_host_weight_cache_lock_timeout=1.0,
         model="unused",
         revision=None,
         model_config={},
@@ -429,7 +429,7 @@ def test_dlo_runtime_cache_is_built_after_final_post_load_mutation(monkeypatch, 
     model.transformer.quant_method = UnquantizedLinearMethod()
     events: list[str] = []
     runtime_plan = HostWeightPlan(
-        backing_kind="runtime_cache",
+        backing_kind="host_weight_cache",
         bindings={},
         runtime_layout_key="layout-key",
         post_load_complete=True,
@@ -474,16 +474,16 @@ def test_dlo_runtime_cache_is_built_after_final_post_load_mutation(monkeypatch, 
         "build_checkpoint_mmap_plan",
         lambda *_args, **_kwargs: HostWeightPlanResult(None, "requires normalization"),
     )
-    monkeypatch.setattr(cache_mod, "build_runtime_weight_cache_plan", build_cache)
+    monkeypatch.setattr(cache_mod, "build_host_weight_cache_plan", build_cache)
 
     assert loader.load_model(load_device="cpu") is model
     assert events == ["load", "process", "calibrate", "eval", "cache"]
     assert loader.take_host_weight_plan() is runtime_plan
 
 
-def test_dlo_registration_prefers_final_runtime_cache_over_checkpoint_plan(monkeypatch, tmp_path):
+def test_dlo_registration_prefers_final_host_weight_cache_over_checkpoint_plan(monkeypatch, tmp_path):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
-    import vllm_omni.diffusion.model_loader.runtime_weight_cache as cache_mod
+    import vllm_omni.diffusion.model_loader.host_weight_cache as cache_mod
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -498,9 +498,9 @@ def test_dlo_registration_prefers_final_runtime_cache_over_checkpoint_plan(monke
         quantization_config=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
-        dlo_enable_runtime_cache=True,
-        dlo_runtime_cache_dir=str(tmp_path),
-        dlo_runtime_cache_pin_limit_gib=1.0,
+        dlo_enable_host_weight_cache=True,
+        dlo_host_weight_cache_dir=str(tmp_path),
+        dlo_host_weight_cache_pin_limit_gib=1.0,
         model="unused",
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
@@ -508,7 +508,7 @@ def test_dlo_registration_prefers_final_runtime_cache_over_checkpoint_plan(monke
     model.transformer = nn.Linear(2, 2, bias=False)
     events: list[str] = []
     runtime_plan = HostWeightPlan(
-        backing_kind="runtime_cache",
+        backing_kind="host_weight_cache",
         bindings={},
         runtime_layout_key="layout-key",
         post_load_complete=True,
@@ -520,23 +520,23 @@ def test_dlo_registration_prefers_final_runtime_cache_over_checkpoint_plan(monke
     loader._apply_skip_softmax_calibration = lambda _model: None  # type: ignore[method-assign]
 
     def unexpected_checkpoint_plan(*_args, **_kwargs):
-        pytest.fail("registered runtime-cache mode must not select the raw checkpoint mmap plan")
+        pytest.fail("registered host weight cache mode must not select the raw checkpoint mmap plan")
 
     def build_cache(_pipeline, **_kwargs):
         events.append("cache")
         return HostWeightPlanResult(runtime_plan)
 
     monkeypatch.setattr(loader_mod, "build_checkpoint_mmap_plan", unexpected_checkpoint_plan)
-    monkeypatch.setattr(cache_mod, "build_runtime_weight_cache_plan", build_cache)
+    monkeypatch.setattr(cache_mod, "build_host_weight_cache_plan", build_cache)
 
     assert loader.load_model(load_device="cpu") is model
     assert events == ["load", "process", "cache"]
     assert loader.take_host_weight_plan() is runtime_plan
 
 
-def test_dlo_runtime_cache_failure_retains_ordinary_weights(monkeypatch, tmp_path):
+def test_dlo_host_weight_cache_failure_retains_ordinary_weights(monkeypatch, tmp_path):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
-    import vllm_omni.diffusion.model_loader.runtime_weight_cache as cache_mod
+    import vllm_omni.diffusion.model_loader.host_weight_cache as cache_mod
 
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -551,8 +551,8 @@ def test_dlo_runtime_cache_failure_retains_ordinary_weights(monkeypatch, tmp_pat
         quantization_config=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
-        dlo_enable_runtime_cache=True,
-        dlo_runtime_cache_dir=str(tmp_path),
+        dlo_enable_host_weight_cache=True,
+        dlo_host_weight_cache_dir=str(tmp_path),
         model="unused",
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
@@ -573,7 +573,7 @@ def test_dlo_runtime_cache_failure_retains_ordinary_weights(monkeypatch, tmp_pat
         assert kwargs["quantization_config"] == "module_quant_method"
         return HostWeightPlanResult(None, "writer timed out", "lock_timeout")
 
-    monkeypatch.setattr(cache_mod, "build_runtime_weight_cache_plan", build_cache)
+    monkeypatch.setattr(cache_mod, "build_host_weight_cache_plan", build_cache)
 
     original_weight = model.transformer.weight.detach().clone()
     assert loader.load_model(load_device="cpu") is model

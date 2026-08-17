@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build node-local runtime-weight cache plans for diffusion DLO.
+"""Build node-local host weight cache plans for diffusion DLO.
 
-``build_runtime_weight_cache_plan`` is the module's single entry point. It
+``build_host_weight_cache_plan`` is the module's single entry point. It
 validates final ordinary-loader DiT tensors, joins or atomically publishes an
 immutable content-addressed entry, validates the mmap result, and returns a
 fail-closed host-weight plan. Reusable identity, hashing, locking, and file
-primitives live in :mod:`runtime_cache_utils`.
+primitives live in :mod:`host_weight_cache_utils`.
 """
 
 from __future__ import annotations
@@ -30,14 +30,9 @@ from safetensors.torch import save_file
 from torch import nn
 from vllm.logger import init_logger
 
-from vllm_omni.diffusion.model_loader.host_weight_plan import (
-    HostWeightPlan,
-    HostWeightPlanResult,
-    TensorBinding,
-)
-from vllm_omni.diffusion.model_loader.runtime_cache_utils import (
+from vllm_omni.diffusion.model_loader.host_weight_cache_utils import (
+    HostWeightCacheError,
     IdentityNormalizationError,
-    RuntimeCacheError,
     RuntimeTensor,
     canonical_json,
     canonicalize_existing_local_path,
@@ -52,15 +47,20 @@ from vllm_omni.diffusion.model_loader.runtime_cache_utils import (
     split_shards,
     tensor_metadata,
 )
+from vllm_omni.diffusion.model_loader.host_weight_plan import (
+    HostWeightPlan,
+    HostWeightPlanResult,
+    TensorBinding,
+)
 
 logger = init_logger(__name__)
 
 # Internal cache-format and I/O defaults, not environment variables. Public
 # configuration may override the root and lock timeout; chunk sizes stay private.
 # Bump the schema to isolate incompatible manifest layouts.
-RUNTIME_CACHE_SCHEMA_VERSION = 1
+HOST_WEIGHT_CACHE_SCHEMA_VERSION = 1
 # Keep the default shared across local stage replicas.
-DEFAULT_RUNTIME_CACHE_ROOT = "~/.cache/vllm-omni/dlo-runtime-weights"
+DEFAULT_HOST_WEIGHT_CACHE_ROOT = "~/.cache/vllm-omni/dlo-host-weights"
 # Bound waits for another publisher instead of hanging initialization forever.
 DEFAULT_LOCK_TIMEOUT_SECONDS = 600.0
 # Avoid one model-sized output file and bound hashing/read working sets.
@@ -83,9 +83,9 @@ for _dtype_name in ("float8_e4m3fn", "float8_e5m2"):
         _SUPPORTED_DTYPES.add(_dtype)
 
 
-def default_runtime_cache_root() -> str:
+def default_host_weight_cache_root() -> str:
     """Return the default root, intentionally independent of VLLM_CACHE_ROOT."""
-    return os.path.expanduser(DEFAULT_RUNTIME_CACHE_ROOT)
+    return os.path.expanduser(DEFAULT_HOST_WEIGHT_CACHE_ROOT)
 
 
 def _persistent_buffer(module: nn.Module, local_name: str) -> bool:
@@ -135,7 +135,7 @@ def _collect_runtime_tensors(
             candidate = RuntimeTensor(runtime_name, tensor, "parameter")
             existing = records.get(runtime_name)
             if existing is not None and existing.tensor is not tensor:
-                raise RuntimeCacheError(
+                raise HostWeightCacheError(
                     "ambiguous_ownership",
                     f"multiple DiT tensors resolve to {runtime_name!r}",
                 )
@@ -147,14 +147,14 @@ def _collect_runtime_tensors(
             candidate = RuntimeTensor(runtime_name, tensor, "buffer")
             existing = records.get(runtime_name)
             if existing is not None and existing.tensor is not tensor:
-                raise RuntimeCacheError(
+                raise HostWeightCacheError(
                     "ambiguous_ownership",
                     f"multiple DiT tensors resolve to {runtime_name!r}",
                 )
             records[runtime_name] = candidate
 
     if not records:
-        raise RuntimeCacheError(
+        raise HostWeightCacheError(
             "ambiguous_ownership",
             "no DiT parameters or persistent buffers were discovered",
         )
@@ -165,37 +165,37 @@ def _collect_runtime_tensors(
         try:
             pipeline_tensor = _resolve_pipeline_tensor(pipeline, record.name)
         except AttributeError as exc:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "ambiguous_ownership",
                 f"DiT tensor {record.name!r} is not owned by the pipeline",
             ) from exc
         if pipeline_tensor is not tensor:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "ambiguous_ownership",
                 f"DiT tensor {record.name!r} does not resolve to the discovered object",
             )
         if tensor.device.type != "cpu" or tensor.is_meta:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_tensor",
                 f"{record.name!r} must be a materialized CPU tensor, got {tensor.device}",
             )
         if tensor.layout != torch.strided:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_tensor",
                 f"{record.name!r} uses unsupported layout {tensor.layout}",
             )
         if not tensor.is_contiguous():
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_tensor",
                 f"{record.name!r} is non-contiguous with stride {tensor.stride()}",
             )
         if tensor.dtype not in _SUPPORTED_DTYPES:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_tensor",
                 f"{record.name!r} uses unsupported dtype {tensor.dtype}",
             )
         if hasattr(tensor, "to_local"):
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_tensor",
                 f"{record.name!r} is a distributed tensor",
             )
@@ -203,7 +203,7 @@ def _collect_runtime_tensors(
         tensor_nbytes = tensor.numel() * tensor.element_size()
         storage = tensor.untyped_storage()
         if tensor.storage_offset() != 0 or storage.nbytes() != tensor_nbytes:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_tensor",
                 f"{record.name!r} is a view into a larger storage",
             )
@@ -211,7 +211,7 @@ def _collect_runtime_tensors(
             storage_id = (storage.data_ptr(), storage.nbytes())
             owner = storage_owners.setdefault(storage_id, record.name)
             if owner != record.name:
-                raise RuntimeCacheError(
+                raise HostWeightCacheError(
                     "unsupported_alias",
                     f"{record.name!r} shares storage with {owner!r}",
                 )
@@ -228,7 +228,7 @@ def _collect_runtime_tensors(
         storage = tensor.untyped_storage()
         owner = storage_owners.get((storage.data_ptr(), storage.nbytes()))
         if owner is not None and owner != pipeline_name:
-            raise RuntimeCacheError(
+            raise HostWeightCacheError(
                 "unsupported_alias",
                 f"cached tensor {owner!r} shares storage with pipeline tensor {pipeline_name!r}",
             )
@@ -250,9 +250,9 @@ def _publish_entry(
     free_bytes = shutil.disk_usage(cache_root).free
     required_bytes = total_nbytes + max(64 * 1024**2, total_nbytes // 100)
     if free_bytes < required_bytes:
-        raise RuntimeCacheError(
+        raise HostWeightCacheError(
             "insufficient_disk",
-            f"runtime cache needs {required_bytes} bytes but only {free_bytes} are free under {cache_root}",
+            f"host weight cache needs {required_bytes} bytes but only {free_bytes} are free under {cache_root}",
         )
 
     tmp_root = cache_root / ".tmp"
@@ -270,7 +270,7 @@ def _publish_entry(
             save_file(
                 {record.name: record.tensor.detach() for record in shard},
                 str(path),
-                metadata={"format": "pt", "dlo_runtime_cache_schema": str(RUNTIME_CACHE_SCHEMA_VERSION)},
+                metadata={"format": "pt", "dlo_host_weight_cache_schema": str(HOST_WEIGHT_CACHE_SCHEMA_VERSION)},
             )
             fsync_file(path)
             file_manifest[filename] = {
@@ -285,7 +285,7 @@ def _publish_entry(
                 }
 
         manifest = {
-            "schema_version": RUNTIME_CACHE_SCHEMA_VERSION,
+            "schema_version": HOST_WEIGHT_CACHE_SCHEMA_VERSION,
             "cache_key": cache_key,
             "layout_identity": layout_identity,
             "runtime_content_sha256": content_digest,
@@ -328,35 +328,35 @@ def _validate_entry(
         with manifest_path.open(encoding="utf-8") as handle:
             manifest = json.load(handle)
     except (OSError, ValueError) as exc:
-        raise RuntimeCacheError("entry_rejected", f"cannot read {manifest_path}: {exc}") from exc
+        raise HostWeightCacheError("entry_rejected", f"cannot read {manifest_path}: {exc}") from exc
 
-    if manifest.get("schema_version") != RUNTIME_CACHE_SCHEMA_VERSION:
-        raise RuntimeCacheError("entry_rejected", "runtime-cache schema mismatch")
+    if manifest.get("schema_version") != HOST_WEIGHT_CACHE_SCHEMA_VERSION:
+        raise HostWeightCacheError("entry_rejected", "host weight cache schema mismatch")
     if manifest.get("cache_key") != cache_key:
-        raise RuntimeCacheError("entry_rejected", "runtime-cache key mismatch")
+        raise HostWeightCacheError("entry_rejected", "host weight cache key mismatch")
     if manifest.get("layout_identity") != layout_identity:
-        raise RuntimeCacheError("entry_rejected", "runtime-cache layout identity mismatch")
+        raise HostWeightCacheError("entry_rejected", "host weight cache layout identity mismatch")
     if manifest.get("runtime_content_sha256") != content_digest:
-        raise RuntimeCacheError("entry_rejected", "runtime-cache content identity mismatch")
+        raise HostWeightCacheError("entry_rejected", "host weight cache content identity mismatch")
 
     expected_metadata = {record.name: tensor_metadata(record) for record in expected_records}
     tensor_manifest = manifest.get("tensors")
     file_manifest = manifest.get("files")
     if not isinstance(tensor_manifest, dict) or not isinstance(file_manifest, dict):
-        raise RuntimeCacheError("entry_rejected", "runtime-cache manifest has invalid sections")
+        raise HostWeightCacheError("entry_rejected", "host weight cache manifest has invalid sections")
     if set(tensor_manifest) != set(expected_metadata):
-        raise RuntimeCacheError("entry_rejected", "runtime-cache tensor names differ from the loaded DiT")
+        raise HostWeightCacheError("entry_rejected", "host weight cache tensor names differ from the loaded DiT")
 
     for filename, metadata in file_manifest.items():
         if Path(filename).name != filename or not isinstance(metadata, dict):
-            raise RuntimeCacheError("entry_rejected", f"invalid cache filename {filename!r}")
+            raise HostWeightCacheError("entry_rejected", f"invalid cache filename {filename!r}")
         path = entry_dir / filename
         try:
             stat = path.stat()
         except OSError as exc:
-            raise RuntimeCacheError("entry_rejected", f"missing cache shard {path}: {exc}") from exc
+            raise HostWeightCacheError("entry_rejected", f"missing cache shard {path}: {exc}") from exc
         if stat.st_size != metadata.get("size") or file_digest(path) != metadata.get("sha256"):
-            raise RuntimeCacheError("entry_rejected", f"content digest mismatch for cache shard {path}")
+            raise HostWeightCacheError("entry_rejected", f"content digest mismatch for cache shard {path}")
 
     bindings: dict[str, TensorBinding] = {}
     mapped_records: list[RuntimeTensor] = []
@@ -369,43 +369,43 @@ def _validate_entry(
         for record in expected_records:
             stored = tensor_manifest.get(record.name)
             if not isinstance(stored, dict):
-                raise RuntimeCacheError("entry_rejected", f"invalid tensor metadata for {record.name!r}")
+                raise HostWeightCacheError("entry_rejected", f"invalid tensor metadata for {record.name!r}")
             filename = stored.get("file")
             storage_key = stored.get("storage_key")
             if filename not in handles or not isinstance(storage_key, str):
-                raise RuntimeCacheError("entry_rejected", f"invalid storage binding for {record.name!r}")
+                raise HostWeightCacheError("entry_rejected", f"invalid storage binding for {record.name!r}")
             actual_metadata = {key: stored.get(key) for key in expected_metadata[record.name]}
             if actual_metadata != expected_metadata[record.name]:
-                raise RuntimeCacheError("entry_rejected", f"metadata mismatch for {record.name!r}")
+                raise HostWeightCacheError("entry_rejected", f"metadata mismatch for {record.name!r}")
             expected_keys_by_file[filename].add(storage_key)
             try:
                 tensor = handles[filename].get_tensor(storage_key)
             except Exception as exc:
-                raise RuntimeCacheError(
+                raise HostWeightCacheError(
                     "entry_rejected",
                     f"cannot map {record.name!r} from {filename}: {exc}",
                 ) from exc
             if tuple(tensor.shape) != tuple(record.tensor.shape) or tensor.dtype != record.tensor.dtype:
-                raise RuntimeCacheError("entry_rejected", f"mapped metadata mismatch for {record.name!r}")
+                raise HostWeightCacheError("entry_rejected", f"mapped metadata mismatch for {record.name!r}")
             mapped_records.append(RuntimeTensor(record.name, tensor, record.kind))
             bindings[record.name] = TensorBinding(storage_key=storage_key, file_path=str(entry_dir / filename))
 
         for filename, expected_keys in expected_keys_by_file.items():
             if set(handles[filename].keys()) != expected_keys:
-                raise RuntimeCacheError("entry_rejected", f"unexpected tensor keys in cache shard {filename}")
+                raise HostWeightCacheError("entry_rejected", f"unexpected tensor keys in cache shard {filename}")
 
         if runtime_content_digest(mapped_records) != content_digest:
-            raise RuntimeCacheError("entry_rejected", "mapped runtime tensor content does not match the publisher")
+            raise HostWeightCacheError("entry_rejected", "mapped runtime tensor content does not match the publisher")
 
     return HostWeightPlan(
-        backing_kind="runtime_cache",
+        backing_kind="host_weight_cache",
         bindings=bindings,
         runtime_layout_key=cache_key,
         post_load_complete=True,
     )
 
 
-def build_runtime_weight_cache_plan(
+def build_host_weight_cache_plan(
     pipeline: nn.Module,
     *,
     dit_modules: Sequence[tuple[str, nn.Module]],
@@ -427,7 +427,7 @@ def build_runtime_weight_cache_plan(
     cfg_parallel_size: int,
     pipeline_parallel_size: int,
 ) -> HostWeightPlanResult:
-    """Build the runtime-cache host-weight plan after ordinary model loading.
+    """Build a host-weight plan from the host weight cache after ordinary loading.
 
     This is the module's main entry point. It first rejects unsupported runtime
     layouts, then discovers and validates the final CPU DiT tensors and derives
@@ -448,33 +448,37 @@ def build_runtime_weight_cache_plan(
             "unsupported_load_format",
         )
     if use_hsdp:
-        return HostWeightPlanResult(None, "HSDP/DTensor layouts are not runtime-cache compatible", "unsupported_hsdp")
+        return HostWeightPlanResult(
+            None, "HSDP/DTensor layouts are not host weight cache compatible", "unsupported_hsdp"
+        )
     if enable_expert_parallel:
         return HostWeightPlanResult(
             None,
-            "expert-parallel weight ownership is outside runtime-cache v1",
+            "expert-parallel weight ownership is outside host weight cache v1",
             "unsupported_expert_parallel",
         )
     if quantization_config is not None:
         return HostWeightPlanResult(
             None,
-            "quantized runtime layouts are not supported by the first runtime-cache version",
+            "quantized runtime layouts are not supported by the first host weight cache version",
             "unsupported_quantization",
         )
     if cfg_parallel_size != 1:
         return HostWeightPlanResult(None, "CFG-parallel component ownership is not proven", "unsupported_cfg_parallel")
     if pipeline_parallel_size != 1:
-        return HostWeightPlanResult(None, "pipeline-parallel ownership is outside runtime-cache v1", "unsupported_pp")
+        return HostWeightPlanResult(
+            None, "pipeline-parallel ownership is outside host weight cache v1", "unsupported_pp"
+        )
     if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds <= 0:
-        return HostWeightPlanResult(None, "runtime-cache lock timeout must be positive", "invalid_configuration")
+        return HostWeightPlanResult(None, "host weight cache lock timeout must be positive", "invalid_configuration")
     if max_shard_bytes <= 0:
-        return HostWeightPlanResult(None, "runtime-cache shard size must be positive", "invalid_configuration")
+        return HostWeightPlanResult(None, "host weight cache shard size must be positive", "invalid_configuration")
 
     try:
         records = _collect_runtime_tensors(pipeline, dit_modules)
         content_digest = runtime_content_digest(records)
         layout_identity = {
-            "schema_version": RUNTIME_CACHE_SCHEMA_VERSION,
+            "schema_version": HOST_WEIGHT_CACHE_SCHEMA_VERSION,
             "model": (canonicalize_existing_local_path(model_identity) if model_identity is not None else None),
             "revision": revision,
             "runtime_dtype": str(runtime_dtype),
@@ -488,8 +492,8 @@ def build_runtime_weight_cache_plan(
             "runtime_content_sha256": content_digest,
         }
         cache_key = hashlib.sha256(canonical_json(layout_identity)).hexdigest()
-        root = Path(cache_root or default_runtime_cache_root()).expanduser().resolve()
-        entries_root = root / f"v{RUNTIME_CACHE_SCHEMA_VERSION}"
+        root = Path(cache_root or default_host_weight_cache_root()).expanduser().resolve()
+        entries_root = root / f"v{HOST_WEIGHT_CACHE_SCHEMA_VERSION}"
         entry_dir = entries_root / cache_key
         entries_root.mkdir(parents=True, exist_ok=True)
 
@@ -502,10 +506,10 @@ def build_runtime_weight_cache_plan(
                     content_digest=content_digest,
                     expected_records=records,
                 )
-                logger.info("Reusing DLO runtime cache entry %s from %s", cache_key[:12], entry_dir)
+                logger.info("Reusing DLO host weight cache entry %s from %s", cache_key[:12], entry_dir)
                 return HostWeightPlanResult(plan)
-            except RuntimeCacheError as exc:
-                logger.warning("DLO runtime cache entry %s will be rebuilt: %s", cache_key[:12], exc)
+            except HostWeightCacheError as exc:
+                logger.warning("DLO host weight cache entry %s will be rebuilt: %s", cache_key[:12], exc)
 
         lock_path = root / ".locks" / f"{cache_key}.lock"
         with exclusive_lock(lock_path, lock_timeout_seconds):
@@ -519,9 +523,9 @@ def build_runtime_weight_cache_plan(
                         content_digest=content_digest,
                         expected_records=records,
                     )
-                    logger.info("Joined DLO runtime cache entry %s from %s", cache_key[:12], entry_dir)
+                    logger.info("Joined DLO host weight cache entry %s from %s", cache_key[:12], entry_dir)
                     return HostWeightPlanResult(plan)
-                except RuntimeCacheError:
+                except HostWeightCacheError:
                     pass
 
             _publish_entry(
@@ -541,25 +545,25 @@ def build_runtime_weight_cache_plan(
                 expected_records=records,
             )
             logger.info(
-                "Published DLO runtime cache entry %s with %d tensors at %s",
+                "Published DLO host weight cache entry %s with %d tensors at %s",
                 cache_key[:12],
                 len(records),
                 entry_dir,
             )
             return HostWeightPlanResult(plan)
-    except RuntimeCacheError as exc:
+    except HostWeightCacheError as exc:
         return HostWeightPlanResult(None, str(exc), exc.code)
     except IdentityNormalizationError as exc:
         return HostWeightPlanResult(None, str(exc), "unstable_identity")
     except Exception as exc:
-        return HostWeightPlanResult(None, f"runtime-cache operation failed: {exc}", "cache_operation_failed")
+        return HostWeightPlanResult(None, f"host weight cache operation failed: {exc}", "cache_operation_failed")
 
 
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT_SECONDS",
-    "DEFAULT_RUNTIME_CACHE_ROOT",
+    "DEFAULT_HOST_WEIGHT_CACHE_ROOT",
     "DEFAULT_SHARD_SIZE_BYTES",
-    "RUNTIME_CACHE_SCHEMA_VERSION",
-    "build_runtime_weight_cache_plan",
-    "default_runtime_cache_root",
+    "HOST_WEIGHT_CACHE_SCHEMA_VERSION",
+    "build_host_weight_cache_plan",
+    "default_host_weight_cache_root",
 ]

@@ -328,8 +328,8 @@ def test_serve_cli_forwards_distributed_offload_residency():
             "--omni",
             "--enable-distributed-layerwise-offload",
             "--dlo-no-use-allgather",
-            "--dlo-enable-runtime-cache",
-            "--dlo-runtime-cache-pin-limit-gib",
+            "--dlo-enable-host-weight-cache",
+            "--dlo-host-weight-cache-pin-limit-gib",
             "80",
             "--dlo-resident-layers",
             "20",
@@ -342,15 +342,15 @@ def test_serve_cli_forwards_distributed_offload_residency():
 
     assert args.enable_distributed_layerwise_offload is True
     assert args.dlo_use_allgather is False
-    assert args.dlo_enable_runtime_cache is True
-    assert args.dlo_runtime_cache_pin_limit_gib == 80
+    assert args.dlo_enable_host_weight_cache is True
+    assert args.dlo_host_weight_cache_pin_limit_gib == 80
     assert args.dlo_resident_layers == 20
     assert engine_args["enable_distributed_layerwise_offload"] is True
     assert engine_args["dlo_use_allgather"] is False
-    assert engine_args["dlo_enable_runtime_cache"] is True
-    assert engine_args["dlo_runtime_cache_dir"] is None
-    assert engine_args["dlo_runtime_cache_lock_timeout"] == 600.0
-    assert engine_args["dlo_runtime_cache_pin_limit_gib"] == 80
+    assert engine_args["dlo_enable_host_weight_cache"] is True
+    assert engine_args["dlo_host_weight_cache_dir"] is None
+    assert engine_args["dlo_host_weight_cache_lock_timeout"] == 600.0
+    assert engine_args["dlo_host_weight_cache_pin_limit_gib"] == 80
     assert engine_args["dlo_resident_layers"] == 20
 
 

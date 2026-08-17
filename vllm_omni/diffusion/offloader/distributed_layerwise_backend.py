@@ -966,7 +966,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         self._using_registered_mmap = False
         self.host_weight_plan = host_weight_plan
         self._mmap_transforms_by_tensor_id: dict[int, Any] = {}
-        self._runtime_cache_mapped_sources: dict[str, list[torch.Tensor]] = {}
+        self._host_weight_cache_mapped_sources: dict[str, list[torch.Tensor]] = {}
         self._host_registration: HostRegistration | None = None
 
     def load_resident_layers(self) -> None:
@@ -1168,7 +1168,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 f"(first 5: {remaining_meta[:5]})."
             )
 
-    def _load_weights_from_runtime_cache(
+    def _load_weights_from_host_weight_cache(
         self,
         pipeline: nn.Module,
         modules,
@@ -1178,9 +1178,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         from safetensors import safe_open
 
         if not plan.post_load_complete:
-            raise RuntimeError("A runtime-cache plan must describe fully post-processed weights")
+            raise RuntimeError("A host weight cache plan must describe fully post-processed weights")
         if any(binding.transform is not None for binding in plan.bindings.values()):
-            raise RuntimeError("Runtime-cache bindings cannot carry deferred checkpoint transforms")
+            raise RuntimeError("Host weight cache bindings cannot carry deferred checkpoint transforms")
 
         required_names: set[str] = set()
         for dit_name, dit_module in zip(modules.dit_names, modules.dits):
@@ -1194,7 +1194,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             missing = sorted(required_names - set(plan.bindings))
             unexpected = sorted(set(plan.bindings) - required_names)
             raise RuntimeError(
-                "Runtime-cache plan coverage changed after loader validation: "
+                "Host weight cache plan coverage changed after loader validation: "
                 f"missing={missing[:5]}, unexpected={unexpected[:5]}"
             )
 
@@ -1209,16 +1209,16 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 try:
                     parent = pipeline.get_submodule(parent_path)
                 except AttributeError as exc:
-                    raise RuntimeError(f"Runtime-cache target module {parent_path!r} no longer exists") from exc
+                    raise RuntimeError(f"Host weight cache target module {parent_path!r} no longer exists") from exc
 
                 target = parent._parameters.get(leaf_name)
                 if target is None:
                     target = parent._buffers.get(leaf_name)
                 if target is None:
-                    raise RuntimeError(f"Runtime-cache target tensor {runtime_name!r} no longer exists")
+                    raise RuntimeError(f"Host weight cache target tensor {runtime_name!r} no longer exists")
                 if target.device.type != "cpu" or target.is_meta:
                     raise RuntimeError(
-                        f"Runtime-cache target {runtime_name!r} is not an ordinary CPU tensor: {target.device}"
+                        f"Host weight cache target {runtime_name!r} is not an ordinary CPU tensor: {target.device}"
                     )
 
                 if binding.file_path not in file_cache:
@@ -1230,7 +1230,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 tensor = file_cache[binding.file_path].get_tensor(binding.storage_key)
                 if tensor.shape != target.shape or tensor.dtype != target.dtype:
                     raise RuntimeError(
-                        f"Runtime-cache metadata changed for {runtime_name!r}: "
+                        f"Host weight cache metadata changed for {runtime_name!r}: "
                         f"cache={tuple(tensor.shape)}/{tensor.dtype}, "
                         f"runtime={tuple(target.shape)}/{target.dtype}"
                     )
@@ -1248,48 +1248,50 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         self._mmap_transforms_by_tensor_id.clear()
         self._mmap_file_cache = file_cache
-        self._runtime_cache_mapped_sources = mapped_sources
+        self._host_weight_cache_mapped_sources = mapped_sources
         logger.info(
-            "Remapped %d final DiT tensors from runtime cache %s",
+            "Remapped %d final DiT tensors from host weight cache %s",
             len(replacements),
             plan.runtime_layout_key[:12] if plan.runtime_layout_key else "unknown",
         )
 
-    def _try_register_runtime_cache_mmap(self) -> bool:
+    def _try_register_host_weight_cache_mmap(self) -> bool:
         """Register complete cache mappings when the operator budget permits."""
-        pin_limit_gib = self.config.dlo_runtime_cache_pin_limit_gib
+        pin_limit_gib = self.config.dlo_host_weight_cache_pin_limit_gib
         if pin_limit_gib <= 0:
             return False
         if not self.config.pin_cpu_memory:
-            logger.warning("DLO runtime-cache registration requires pin_cpu_memory=True; using bounded host staging")
+            logger.warning(
+                "DLO host weight cache registration requires pin_cpu_memory=True; using bounded host staging"
+            )
             return False
-        if not self._runtime_cache_mapped_sources:
-            logger.warning("DLO runtime-cache registration found no mapped sources; using bounded host staging")
+        if not self._host_weight_cache_mapped_sources:
+            logger.warning("DLO host weight cache registration found no mapped sources; using bounded host staging")
             return False
 
         max_bytes = int(pin_limit_gib * 1024**3)
         started = time.perf_counter()
         try:
             registration = register_host_mappings(
-                self._runtime_cache_mapped_sources,
+                self._host_weight_cache_mapped_sources,
                 device=self.device,
                 max_bytes=max_bytes,
             )
         except HostRegistrationCleanupError:
             # Falling back could unmap a range the platform still owns. Abort
             # the worker so process/context teardown provides final cleanup.
-            logger.exception("DLO runtime-cache registration rollback failed")
+            logger.exception("DLO host weight cache registration rollback failed")
             raise
         except HostRegistrationError as exc:
             logger.warning(
-                "DLO runtime-cache direct H2D unavailable (%s); using bounded host staging",
+                "DLO host weight cache direct H2D unavailable (%s); using bounded host staging",
                 exc,
             )
             return False
 
         self._host_registration = registration
         logger.info(
-            "Registered %.2f GiB of shared runtime-cache mappings in %d range(s) for direct H2D in %.3f s",
+            "Registered %.2f GiB of shared host weight cache mappings in %d range(s) for direct H2D in %.3f s",
             registration.total_bytes / 1024**3,
             registration.region_count,
             time.perf_counter() - started,
@@ -1303,12 +1305,12 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         errors = registration.close()
         if errors:
             logger.error(
-                "DLO runtime-cache host unregistration failed; retaining mmap handles for retry/process exit: %s",
+                "DLO host weight cache unregistration failed; retaining mmap handles for retry/process exit: %s",
                 errors[:3],
             )
             return False
         self._host_registration = None
-        logger.info("Unregistered DLO runtime-cache host mappings")
+        logger.info("Unregistered DLO host weight cache mappings")
         return True
 
     def _init_dp_group(self) -> None:
@@ -1657,11 +1659,11 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                     modules,
                     self.host_weight_plan,
                 )
-            elif self.host_weight_plan.backing_kind == "runtime_cache":
+            elif self.host_weight_plan.backing_kind == "host_weight_cache":
                 if self.config.dlo_use_allgather:
-                    raise ValueError("Runtime-cache backing is no-AllGather only in the first implementation")
+                    raise ValueError("Host weight cache backing is no-AllGather only in the first implementation")
                 self._using_rank_local_mmap = True
-                self._load_weights_from_runtime_cache(
+                self._load_weights_from_host_weight_cache(
                     pipeline,
                     modules,
                     self.host_weight_plan,
@@ -1847,9 +1849,13 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
 
         if not self._all_hook_groups:
             self.enabled = bool(self._resident_blocks)
-            if self.enabled and self._using_rank_local_mmap and self.host_weight_plan.backing_kind == "runtime_cache":
-                self._using_registered_mmap = self._try_register_runtime_cache_mmap()
-                self._runtime_cache_mapped_sources.clear()
+            if (
+                self.enabled
+                and self._using_rank_local_mmap
+                and self.host_weight_plan.backing_kind == "host_weight_cache"
+            ):
+                self._using_registered_mmap = self._try_register_host_weight_cache_mmap()
+                self._host_weight_cache_mapped_sources.clear()
                 assert self._resident_layer_group is not None
                 self._resident_layer_group.registered_mmap = self._using_registered_mmap
                 if self._using_registered_mmap:
@@ -1870,9 +1876,9 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
         if self.dp_size > 1:
             unified_shard_buffers = self._allocate_shared_shard_buffers(all_hooks)
 
-        if self._using_rank_local_mmap and self.host_weight_plan.backing_kind == "runtime_cache":
-            self._using_registered_mmap = self._try_register_runtime_cache_mmap()
-            self._runtime_cache_mapped_sources.clear()
+        if self._using_rank_local_mmap and self.host_weight_plan.backing_kind == "host_weight_cache":
+            self._using_registered_mmap = self._try_register_host_weight_cache_mmap()
+            self._host_weight_cache_mapped_sources.clear()
             for hook in all_hooks:
                 hook.registered_mmap = self._using_registered_mmap
             if self._resident_layer_group is not None:
@@ -1962,7 +1968,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
     def _release_mmap_handles(self) -> None:
         """Release safetensors mmap file handles."""
         self._mmap_transforms_by_tensor_id.clear()
-        self._runtime_cache_mapped_sources.clear()
+        self._host_weight_cache_mapped_sources.clear()
         if hasattr(self, "_mmap_file_cache"):
             self._mmap_file_cache.clear()
             del self._mmap_file_cache

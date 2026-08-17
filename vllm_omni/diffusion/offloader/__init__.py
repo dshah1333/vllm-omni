@@ -72,7 +72,7 @@ def get_offload_backend(
         od_config: OmniDiffusionConfig with offload settings
         device: Target device (auto-detected if None)
         host_weight_plan: Exact loader-produced backing plan. Checkpoint plans
-            may have skipped ordinary materialization; runtime-cache plans
+            may have skipped ordinary materialization; host weight cache plans
             describe already-valid ordinary tensors that can be remapped.
 
     Returns:
@@ -92,7 +92,7 @@ def get_offload_backend(
             raise RuntimeError(
                 "A loader-owned DLO host-weight plan was produced, but distributed layerwise offload is not selected"
             )
-        logger.warning("Ignoring optional runtime-cache plan because distributed layerwise offload is not selected")
+        logger.warning("Ignoring optional host weight cache plan because distributed layerwise offload is not selected")
         host_weight_plan = None
 
     # Return None if no offloading requested

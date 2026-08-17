@@ -3,7 +3,7 @@
 Distributed layerwise offloading (DLO) streams DiT blocks through two device
 buffers instead of keeping the complete DiT in HBM. It supports sharded host
 weights with AllGather or independently streamed rank-local weights. The
-no-AllGather path can optionally share node-local runtime weights through mmap.
+no-AllGather path can optionally share node-local host weights through mmap.
 
 See the [shared DLO component architecture](../../../design/feature/offloader/distributed_layerwise_offload.md#architecture)
 for ownership and lifecycle coordination. The mode-specific internals are
@@ -18,10 +18,10 @@ and
 | --- | --- | --- | --- |
 | DLO AllGather (default) | DP ranks execute the same block path in lockstep | About `1 / dp_size` per rank | DLO weight AllGather |
 | no-AllGather | Ranks or engines must schedule independently | Complete rank-local layout | No DLO weight collective |
-| no-AllGather + runtime cache | Equivalent independent workers share one node | Shared final mmap layout per TP coordinate | No DLO weight collective |
-| runtime cache + host registration | The platform supports registration and recurrent staging is too expensive | Shared registered mmap layout | No DLO weight collective |
+| no-AllGather + host weight cache | Equivalent independent workers share one node | Shared final mmap layout per TP coordinate | No DLO weight collective |
+| host weight cache + host registration | The platform supports registration and recurrent staging is too expensive | Shared registered mmap layout | No DLO weight collective |
 
-AllGather is normally the best choice for synchronized DP. Runtime-cache mode
+AllGather is normally the best choice for synchronized DP. Host weight cache mode
 targets independently scheduled replicas, especially repeated TP engines on
 one node.
 
@@ -38,13 +38,13 @@ vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --dlo-no-use-allgather
 
-# Share final runtime weights and register up to 80 GiB per worker for direct H2D
+# Share final host weights and register up to 80 GiB per worker for direct H2D
 vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --tensor-parallel-size 2 \
   --dlo-no-use-allgather \
-  --dlo-enable-runtime-cache \
-  --dlo-runtime-cache-pin-limit-gib 80
+  --dlo-enable-host-weight-cache \
+  --dlo-host-weight-cache-pin-limit-gib 80
 ```
 
 ## Relevant options
@@ -53,13 +53,14 @@ vllm serve /path/to/model --omni \
 | --- | --- | --- |
 | `--enable-distributed-layerwise-offload` | Enable DLO | `false` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks independently | `false` |
-| `--dlo-enable-runtime-cache` | Share final no-AllGather DiT weights through a node-local mmap cache | `false` |
-| `--dlo-runtime-cache-pin-limit-gib GIB` | Per-worker registration budget; zero uses bounded host staging | `0` |
+| `--dlo-enable-host-weight-cache` | Share final no-AllGather DiT weights through a node-local mmap cache | `false` |
+| `--dlo-host-weight-cache-pin-limit-gib GIB` | Per-worker registration budget; zero uses bounded host staging | `0` |
 | `--dlo-resident-layers N` | Keep eligible leading DiT blocks resident in HBM | `0` |
 
-The runtime cache uses `~/.cache/vllm-omni/dlo-runtime-weights`. Programmatic
-configuration may override `dlo_runtime_cache_dir` and the writer lock timeout;
-these advanced storage controls are intentionally not separate CLI flags.
+The host weight cache uses `~/.cache/vllm-omni/dlo-host-weights`. Programmatic
+configuration may override `dlo_host_weight_cache_dir` and the writer lock
+timeout; these advanced storage controls are intentionally not separate CLI
+flags.
 
 ## Operational notes
 
@@ -74,8 +75,8 @@ these advanced storage controls are intentionally not separate CLI flags.
 - Registration is process-local but does not duplicate the underlying file
   pages. Each worker must still satisfy its platform and OS page-locking limits.
 - Shutdown unregisters host ranges before closing their mmap handles.
-- Runtime-cache v1 has no automatic eviction. Stop all users of an entry before
-  deleting it.
+- Host weight cache v1 has no automatic eviction. Stop all users of an entry
+  before deleting it.
 
 ## Scheduling constraints
 
@@ -88,12 +89,12 @@ SP model collectives still synchronize ranks within each engine.
 
 ## Limitations
 
-- Direct checkpoint mmap currently requires TP1. The runtime cache can share
+- Direct checkpoint mmap currently requires TP1. The host weight cache can share
   final ordinary-loader layouts between matching TP coordinates at TP1 or TP>1.
-- Runtime-cache v1 rejects quantized, non-contiguous, aliased/tied, device-only,
-  HSDP, expert-parallel, CFG-parallel, and PP layouts.
-- HSDP plus DLO AllGather is unsupported, and runtime-cache v1 rejects HSDP.
-- The runtime cache changes steady-state host backing, not startup loading:
+- Host weight cache v1 rejects quantized, non-contiguous, aliased/tied,
+  device-only, HSDP, expert-parallel, CFG-parallel, and PP layouts.
+- HSDP plus DLO AllGather is unsupported, and host weight cache v1 rejects HSDP.
+- The host weight cache changes steady-state host backing, not startup loading:
   each worker still performs ordinary loading and full content validation.
 - Skip-load-on-hit, cache eviction, and cross-node sharing remain follow-up
   work in
