@@ -1,0 +1,174 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="850" viewBox="0 0 1280 850" role="img" aria-labelledby="title desc">
+  <title id="title">No-AllGather DLO shared host weights and independent runtime orchestration</title>
+  <desc id="desc">Two independently scheduled diffusion engines on one node map the same immutable runtime-cache weight pages. Each worker owns its mmap view, optional host registration, DLO hooks, streams, events, and two GPU device slots. Complete blocks move independently from the shared host pages to each GPU without a cross-engine DLO AllGather. TP1 is shown; tensor parallel deployments repeat one shared cache entry per TP coordinate.</desc>
+  <defs>
+    <marker id="request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="mapping-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#d97706"/>
+    </marker>
+    <marker id="runtime-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .canvas { fill: #ffffff; stroke: #e2e8f0; }
+      .node { fill: #f8fafc; stroke: #cbd5e1; }
+      .engine { fill: #ffffff; stroke: #cbd5e1; }
+      .router { fill: #f5f3ff; stroke: #c4b5fd; }
+      .scope { fill: #f8fafc; stroke: #cbd5e1; }
+      .cache { fill: #fff7ed; stroke: #fdba74; }
+      .payload { fill: #d97706; }
+      .loader { fill: #f1f5f9; stroke: #cbd5e1; }
+      .mapping { fill: #fffbeb; stroke: #f59e0b; }
+      .hook { fill: #eff6ff; stroke: #60a5fa; }
+      .gpu { fill: #f0fdf4; stroke: #86efac; }
+      .slot-current { fill: #16a34a; }
+      .slot-next { fill: #bbf7d0; stroke: #22c55e; }
+      .no-collective { fill: #fef2f2; stroke: #fca5a5; }
+      .title { font: 700 25px system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 13px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .section { font: 700 15px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1e293b; }
+      .section-sub { font: 500 11.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; }
+      .eyebrow { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; letter-spacing: .8px; fill: #64748b; }
+      .box-title { font: 700 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #1e293b; }
+      .box-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .payload-title { font: 700 14px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .payload-text { font: 500 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .slot-text { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .slot-next-text { font: 700 10px system-ui, -apple-system, Segoe UI, sans-serif; fill: #166534; }
+      .arrow-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .request-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6d28d9; }
+      .no-title { font: 700 12px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b91c1c; }
+      .no-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #7f1d1d; }
+      .request-path { fill: none; stroke: #7c3aed; stroke-width: 2; marker-end: url(#request-arrow); }
+      .mapping-path { fill: none; stroke: #d97706; stroke-width: 2; marker-end: url(#mapping-arrow); }
+      .runtime-path { fill: none; stroke: #2563eb; stroke-width: 2; marker-end: url(#runtime-arrow); }
+      .control-path { fill: none; stroke: #2563eb; stroke-width: 1.5; stroke-dasharray: 4 3; marker-end: url(#runtime-arrow); }
+    </style>
+  </defs>
+
+  <rect x="12" y="12" width="1256" height="826" rx="14" class="canvas"/>
+
+  <text id="title-text" x="40" y="50" class="title">No-AllGather DLO: one shared host payload, independent runtimes</text>
+  <text x="40" y="74" class="subtitle">TP1 shown; TP&gt;1 repeats this mapping once per TP coordinate, shared by equivalent workers across engines</text>
+
+  <!-- External orchestration remains outside DLO. -->
+  <rect x="390" y="94" width="500" height="68" rx="10" class="router"/>
+  <text x="640" y="121" text-anchor="middle" class="section">External router / orchestrator</text>
+  <text x="640" y="144" text-anchor="middle" class="section-sub">independent request placement &#183; outside vLLM-Omni DLO</text>
+
+  <!-- One node-local physical backing. -->
+  <rect x="30" y="184" width="1220" height="634" rx="14" class="node"/>
+  <text x="52" y="211" class="eyebrow">ONE NODE &#183; SHARED PHYSICAL HOST MEMORY, PROCESS-LOCAL RUNTIMES</text>
+
+  <rect x="58" y="230" width="242" height="140" rx="10" class="scope"/>
+  <text x="78" y="256" class="eyebrow">SHARING SCOPE</text>
+  <text x="78" y="282" class="box-title">TP1: one full cache entry</text>
+  <text x="78" y="305" class="box-text">TP&gt;1: one entry per TP coordinate</text>
+  <text x="78" y="326" class="box-text">Equivalent engines reuse that entry;</text>
+  <text x="78" y="347" class="box-text">different TP ranks never alias layouts.</text>
+
+  <rect x="330" y="230" width="620" height="140" rx="10" class="cache"/>
+  <text x="350" y="256" class="eyebrow">NODE-LOCAL IMMUTABLE RUNTIME CACHE</text>
+  <rect x="370" y="272" width="540" height="60" rx="8" class="payload"/>
+  <text x="640" y="297" text-anchor="middle" class="payload-title">1&#215; physical runtime-weight payload</text>
+  <text x="640" y="318" text-anchor="middle" class="payload-text">file-backed tensor pages shared by the OS page cache</text>
+  <text x="640" y="353" text-anchor="middle" class="box-text">Identity includes final layout + TP coordinate; engine and DP replica are excluded</text>
+
+  <rect x="980" y="230" width="242" height="140" rx="10" class="scope"/>
+  <text x="1000" y="256" class="eyebrow">WHAT STAYS PRIVATE</text>
+  <text x="1000" y="282" class="box-title">Per worker / process</text>
+  <text x="1000" y="305" class="box-text">mmap object and validation state</text>
+  <text x="1000" y="326" class="box-text">optional host registration</text>
+  <text x="1000" y="347" class="box-text">hooks, streams, events, GPU slots</text>
+
+  <!-- Independent engine A. -->
+  <rect x="55" y="410" width="540" height="300" rx="12" class="engine"/>
+  <text x="79" y="439" class="section">Independent engine A</text>
+  <text x="79" y="459" class="section-sub">own request schedule &#183; own DLO backend state</text>
+
+  <rect x="80" y="485" width="205" height="72" rx="8" class="loader"/>
+  <text x="182" y="508" text-anchor="middle" class="eyebrow">STARTUP</text>
+  <text x="182" y="529" text-anchor="middle" class="box-title">ordinary loader</text>
+  <text x="182" y="547" text-anchor="middle" class="box-text">final transforms &#8594; publish / join</text>
+
+  <rect x="360" y="485" width="205" height="72" rx="8" class="mapping"/>
+  <text x="462" y="508" text-anchor="middle" class="eyebrow">HOST VIEW</text>
+  <text x="462" y="529" text-anchor="middle" class="box-title">mmap of shared pages</text>
+  <text x="462" y="547" text-anchor="middle" class="box-text">optional process-local registration</text>
+
+  <rect x="80" y="590" width="205" height="84" rx="8" class="hook"/>
+  <text x="182" y="614" text-anchor="middle" class="eyebrow">RUNTIME CONTROL</text>
+  <text x="182" y="636" text-anchor="middle" class="box-title">DLO backend + block hook</text>
+  <text x="182" y="655" text-anchor="middle" class="box-text">select &#183; prefetch &#183; repoint &#183; rotate</text>
+
+  <rect x="360" y="580" width="205" height="104" rx="8" class="gpu"/>
+  <text x="462" y="604" text-anchor="middle" class="eyebrow">GPU A &#183; TWO DEVICE SLOTS</text>
+  <rect x="378" y="620" width="78" height="42" rx="5" class="slot-current"/>
+  <text x="417" y="638" text-anchor="middle" class="slot-text">SLOT 0</text>
+  <text x="417" y="653" text-anchor="middle" class="slot-text">current</text>
+  <rect x="469" y="620" width="78" height="42" rx="5" class="slot-next"/>
+  <text x="508" y="638" text-anchor="middle" class="slot-next-text">SLOT 1</text>
+  <text x="508" y="653" text-anchor="middle" class="slot-next-text">prefetch</text>
+
+  <!-- Independent engine B. -->
+  <rect x="685" y="410" width="540" height="300" rx="12" class="engine"/>
+  <text x="709" y="439" class="section">Independent engine B</text>
+  <text x="709" y="459" class="section-sub">own request schedule &#183; own DLO backend state</text>
+
+  <rect x="710" y="485" width="205" height="72" rx="8" class="loader"/>
+  <text x="812" y="508" text-anchor="middle" class="eyebrow">STARTUP</text>
+  <text x="812" y="529" text-anchor="middle" class="box-title">ordinary loader</text>
+  <text x="812" y="547" text-anchor="middle" class="box-text">final transforms &#8594; publish / join</text>
+
+  <rect x="990" y="485" width="205" height="72" rx="8" class="mapping"/>
+  <text x="1092" y="508" text-anchor="middle" class="eyebrow">HOST VIEW</text>
+  <text x="1092" y="529" text-anchor="middle" class="box-title">mmap of shared pages</text>
+  <text x="1092" y="547" text-anchor="middle" class="box-text">optional process-local registration</text>
+
+  <rect x="710" y="590" width="205" height="84" rx="8" class="hook"/>
+  <text x="812" y="614" text-anchor="middle" class="eyebrow">RUNTIME CONTROL</text>
+  <text x="812" y="636" text-anchor="middle" class="box-title">DLO backend + block hook</text>
+  <text x="812" y="655" text-anchor="middle" class="box-text">select &#183; prefetch &#183; repoint &#183; rotate</text>
+
+  <rect x="990" y="580" width="205" height="104" rx="8" class="gpu"/>
+  <text x="1092" y="604" text-anchor="middle" class="eyebrow">GPU B &#183; TWO DEVICE SLOTS</text>
+  <rect x="1008" y="620" width="78" height="42" rx="5" class="slot-current"/>
+  <text x="1047" y="638" text-anchor="middle" class="slot-text">SLOT 0</text>
+  <text x="1047" y="653" text-anchor="middle" class="slot-text">current</text>
+  <rect x="1099" y="620" width="78" height="42" rx="5" class="slot-next"/>
+  <text x="1138" y="638" text-anchor="middle" class="slot-next-text">SLOT 1</text>
+  <text x="1138" y="653" text-anchor="middle" class="slot-next-text">prefetch</text>
+
+  <!-- Independent request routing remains outside the DLO data path. -->
+  <path d="M 470 162 C 310 170, 110 176, 22 176 L 22 378 C 22 400, 80 410, 130 410" class="request-path"/>
+  <text x="42" y="394" class="request-label">request A</text>
+  <path d="M 810 162 C 970 170, 1170 176, 1258 176 L 1258 378 C 1258 400, 1200 410, 1150 410" class="request-path"/>
+  <text x="1238" y="394" text-anchor="end" class="request-label">request B</text>
+
+  <!-- Runtime mmap fan-out from one physical host payload. -->
+
+  <path d="M 455 370 C 440 410, 452 446, 462 485" class="mapping-path"/>
+  <text x="405" y="451" class="arrow-label">same pages</text>
+  <path d="M 825 370 C 970 404, 1070 432, 1092 485" class="mapping-path"/>
+  <text x="970" y="451" class="arrow-label">same pages</text>
+
+  <!-- Independent runtime data paths. -->
+  <path d="M 462 557 C 448 578, 320 578, 285 614" class="control-path"/>
+  <text x="350" y="575" text-anchor="middle" class="arrow-label">tensor views</text>
+  <path d="M 285 632 L 360 632" class="runtime-path"/>
+  <text x="322" y="620" text-anchor="middle" class="arrow-label">full-block H2D</text>
+
+  <path d="M 1092 557 C 1078 578, 950 578, 915 614" class="control-path"/>
+  <text x="980" y="575" text-anchor="middle" class="arrow-label">tensor views</text>
+  <path d="M 915 632 L 990 632" class="runtime-path"/>
+  <text x="952" y="620" text-anchor="middle" class="arrow-label">full-block H2D</text>
+
+  <text x="640" y="730" text-anchor="middle" class="section-sub">Ordinary TP / SP model collectives, when configured, remain inside each engine</text>
+  <rect x="365" y="750" width="550" height="44" rx="8" class="no-collective"/>
+  <circle cx="395" cy="772" r="12" fill="#dc2626"/>
+  <path d="M 389 766 L 401 778 M 401 766 L 389 778" stroke="#ffffff" stroke-width="2.2"/>
+  <text x="420" y="768" class="no-title">No cross-engine DLO AllGather</text>
+  <text x="420" y="785" class="no-text">shared host pages do not couple request order, progress, or failure domains</text>
+</svg>

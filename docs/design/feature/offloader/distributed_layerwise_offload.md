@@ -368,6 +368,14 @@ one and streams complete blocks using H2D copies only. The host backing may be
 a loader-approved checkpoint mapping, a normalized runtime-cache mapping, or
 ordinary runtime tensors.
 
+![No-AllGather DLO shared host weights and independent runtime orchestration](../../figures/dlo/dlo_no_allgather_shared_host.svg)
+
+The figure uses TP1 to make physical sharing explicit. With TP greater than
+one, the cache keeps one immutable entry per TP coordinate and equivalent
+workers in independent engines map the corresponding entry. An external
+router or orchestrator chooses each engine's requests; DLO coordinates only
+the worker-local mapping, hooks, transfer streams, events, and device slots.
+
 For direct mmap, each process retains immutable safetensors views and uses two
 bounded pinned host staging slots. Processes on the same node that map the same
 files share physical checkpoint pages through the OS page cache. This removes
