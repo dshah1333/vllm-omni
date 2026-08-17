@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="850" viewBox="0 0 1280 850" role="img" aria-labelledby="title desc">
   <title id="title">No-AllGather DLO shared host weights and independent runtime orchestration</title>
-  <desc id="desc">An external orchestrator routes requests to two independently scheduled diffusion engines on one node. Each engine has its own loader, mmap view, DLO runtime hooks, streams, events, and GPU device slots. Both engines map the same immutable runtime-cache weight pages stored at the bottom of the diagram, without a cross-engine DLO AllGather. TP1 is shown; tensor parallel deployments repeat one shared cache entry per TP coordinate.</desc>
+  <desc id="desc">An external orchestrator routes requests to two independently scheduled TP2 diffusion engines on one node. Each engine contains two rank-local workers and devices, with private loaders, mmap views, DLO runtime hooks, streams, events, and rotating GPU slots. Equivalent TP0 workers across engines map one immutable TP0 runtime-cache payload, while equivalent TP1 workers map a separate TP1 payload, without a cross-engine DLO AllGather.</desc>
   <defs>
     <marker id="request-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c3aed"/>
@@ -23,6 +23,7 @@
       .mapping { fill: #fffbeb; stroke: #f59e0b; }
       .hook { fill: #eff6ff; stroke: #60a5fa; }
       .gpu { fill: #f0fdf4; stroke: #86efac; }
+      .device { fill: #ffffff; stroke: #86efac; }
       .slot-current { fill: #16a34a; }
       .slot-next { fill: #bbf7d0; stroke: #22c55e; }
       .no-collective { fill: #fef2f2; stroke: #fca5a5; }
@@ -35,8 +36,9 @@
       .box-text { font: 500 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
       .payload-title { font: 700 14px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
       .payload-text { font: 500 11px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
-      .slot-text { font: 700 9px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
-      .slot-next-text { font: 700 9px system-ui, -apple-system, Segoe UI, sans-serif; fill: #166534; }
+      .device-title { font: 700 9px system-ui, -apple-system, Segoe UI, sans-serif; fill: #166534; }
+      .slot-text { font: 700 8px system-ui, -apple-system, Segoe UI, sans-serif; fill: #ffffff; }
+      .slot-next-text { font: 700 8px system-ui, -apple-system, Segoe UI, sans-serif; fill: #166534; }
       .arrow-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
       .request-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #6d28d9; }
       .mapping-label { font: 600 10.5px system-ui, -apple-system, Segoe UI, sans-serif; fill: #b45309; }
@@ -51,8 +53,8 @@
 
   <rect x="12" y="12" width="1256" height="826" rx="14" class="canvas"/>
 
-  <text id="title-text" x="40" y="50" class="title">No-AllGather DLO: one shared host payload, independent runtimes</text>
-  <text x="40" y="74" class="subtitle">TP1 shown; TP&gt;1 repeats this mapping once per TP coordinate, shared by equivalent workers across engines</text>
+  <text id="title-text" x="40" y="50" class="title">No-AllGather DLO: TP-coordinate host sharing, independent engines</text>
+  <text x="40" y="74" class="subtitle">TP2 shown: each engine owns two devices; equivalent workers share one host payload per TP coordinate</text>
 
   <!-- The control plane remains outside DLO. -->
   <rect x="390" y="94" width="500" height="68" rx="10" class="router"/>
@@ -72,78 +74,92 @@
   <!-- Independent engine A. -->
   <rect x="45" y="232" width="575" height="250" rx="12" class="engine"/>
   <text x="68" y="261" class="section">Independent engine A</text>
-  <text x="68" y="281" class="section-sub">own request schedule &#183; own DLO backend state</text>
+  <text x="68" y="281" class="section-sub">TP2 &#183; two rank-local workers &#183; own request schedule and DLO state</text>
 
-  <rect x="68" y="310" width="115" height="130" rx="8" class="loader"/>
-  <text x="125" y="335" text-anchor="middle" class="eyebrow">STARTUP</text>
-  <text x="125" y="360" text-anchor="middle" class="box-title">ordinary loader</text>
-  <text x="125" y="384" text-anchor="middle" class="box-text">final transforms</text>
-  <text x="125" y="403" text-anchor="middle" class="box-text">publish / join</text>
-  <text x="125" y="422" text-anchor="middle" class="box-text">runtime cache</text>
+  <rect x="68" y="310" width="98" height="130" rx="8" class="loader"/>
+  <text x="117" y="335" text-anchor="middle" class="eyebrow">STARTUP &#215;2</text>
+  <text x="117" y="359" text-anchor="middle" class="box-title">rank-local</text>
+  <text x="117" y="377" text-anchor="middle" class="box-title">loaders</text>
+  <text x="117" y="402" text-anchor="middle" class="box-text">final transforms</text>
+  <text x="117" y="421" text-anchor="middle" class="box-text">publish / join</text>
 
-  <rect x="201" y="310" width="125" height="130" rx="8" class="mapping"/>
-  <text x="263" y="335" text-anchor="middle" class="eyebrow">HOST VIEW</text>
-  <text x="263" y="360" text-anchor="middle" class="box-title">mmap of shared</text>
-  <text x="263" y="378" text-anchor="middle" class="box-title">weight pages</text>
-  <text x="263" y="403" text-anchor="middle" class="box-text">process-local view</text>
-  <text x="263" y="422" text-anchor="middle" class="box-text">optional registration</text>
+  <rect x="180" y="310" width="112" height="130" rx="8" class="mapping"/>
+  <text x="236" y="335" text-anchor="middle" class="eyebrow">HOST VIEWS &#215;2</text>
+  <text x="236" y="359" text-anchor="middle" class="box-title">TP0 mmap</text>
+  <text x="236" y="377" text-anchor="middle" class="box-title">TP1 mmap</text>
+  <text x="236" y="402" text-anchor="middle" class="box-text">process-local</text>
+  <text x="236" y="421" text-anchor="middle" class="box-text">optional registration</text>
 
-  <rect x="344" y="310" width="135" height="130" rx="8" class="hook"/>
-  <text x="411" y="335" text-anchor="middle" class="eyebrow">RUNTIME CONTROL</text>
-  <text x="411" y="360" text-anchor="middle" class="box-title">DLO backend</text>
-  <text x="411" y="378" text-anchor="middle" class="box-title">+ block hook</text>
-  <text x="411" y="403" text-anchor="middle" class="box-text">select &#183; prefetch</text>
-  <text x="411" y="422" text-anchor="middle" class="box-text">repoint &#183; rotate</text>
+  <rect x="306" y="310" width="120" height="130" rx="8" class="hook"/>
+  <text x="366" y="335" text-anchor="middle" class="eyebrow">RUNTIME &#215;2</text>
+  <text x="366" y="359" text-anchor="middle" class="box-title">DLO backends</text>
+  <text x="366" y="377" text-anchor="middle" class="box-title">+ block hooks</text>
+  <text x="366" y="402" text-anchor="middle" class="box-text">private streams</text>
+  <text x="366" y="421" text-anchor="middle" class="box-text">events + state</text>
 
-  <rect x="497" y="310" width="100" height="130" rx="8" class="gpu"/>
-  <text x="547" y="335" text-anchor="middle" class="eyebrow">GPU A</text>
-  <text x="547" y="355" text-anchor="middle" class="box-text">two device slots</text>
-  <rect x="510" y="373" width="74" height="24" rx="5" class="slot-current"/>
-  <text x="547" y="389" text-anchor="middle" class="slot-text">SLOT 0 &#183; NOW</text>
-  <rect x="510" y="404" width="74" height="24" rx="5" class="slot-next"/>
-  <text x="547" y="420" text-anchor="middle" class="slot-next-text">SLOT 1 &#183; NEXT</text>
+  <rect x="440" y="310" width="157" height="130" rx="8" class="gpu"/>
+  <text x="518" y="330" text-anchor="middle" class="eyebrow">TWO DEVICES</text>
+  <rect x="450" y="340" width="137" height="42" rx="6" class="device"/>
+  <text x="518" y="353" text-anchor="middle" class="device-title">TP0 &#183; GPU A0</text>
+  <rect x="457" y="359" width="58" height="16" rx="4" class="slot-current"/>
+  <text x="486" y="370" text-anchor="middle" class="slot-text">SLOT 0 NOW</text>
+  <rect x="521" y="359" width="58" height="16" rx="4" class="slot-next"/>
+  <text x="550" y="370" text-anchor="middle" class="slot-next-text">SLOT 1 NEXT</text>
+  <rect x="450" y="389" width="137" height="42" rx="6" class="device"/>
+  <text x="518" y="402" text-anchor="middle" class="device-title">TP1 &#183; GPU A1</text>
+  <rect x="457" y="408" width="58" height="16" rx="4" class="slot-current"/>
+  <text x="486" y="419" text-anchor="middle" class="slot-text">SLOT 0 NOW</text>
+  <rect x="521" y="408" width="58" height="16" rx="4" class="slot-next"/>
+  <text x="550" y="419" text-anchor="middle" class="slot-next-text">SLOT 1 NEXT</text>
 
-  <path d="M 183 375 L 201 375" class="startup-path"/>
-  <path d="M 326 375 L 344 375" class="runtime-path"/>
-  <path d="M 479 375 L 497 375" class="runtime-path"/>
+  <path d="M 166 375 L 180 375" class="startup-path"/>
+  <path d="M 292 375 L 306 375" class="runtime-path"/>
+  <path d="M 426 375 L 440 375" class="runtime-path"/>
 
   <!-- Independent engine B. -->
   <rect x="660" y="232" width="575" height="250" rx="12" class="engine"/>
   <text x="683" y="261" class="section">Independent engine B</text>
-  <text x="683" y="281" class="section-sub">own request schedule &#183; own DLO backend state</text>
+  <text x="683" y="281" class="section-sub">TP2 &#183; two rank-local workers &#183; own request schedule and DLO state</text>
 
-  <rect x="683" y="310" width="115" height="130" rx="8" class="loader"/>
-  <text x="740" y="335" text-anchor="middle" class="eyebrow">STARTUP</text>
-  <text x="740" y="360" text-anchor="middle" class="box-title">ordinary loader</text>
-  <text x="740" y="384" text-anchor="middle" class="box-text">final transforms</text>
-  <text x="740" y="403" text-anchor="middle" class="box-text">publish / join</text>
-  <text x="740" y="422" text-anchor="middle" class="box-text">runtime cache</text>
+  <rect x="683" y="310" width="98" height="130" rx="8" class="loader"/>
+  <text x="732" y="335" text-anchor="middle" class="eyebrow">STARTUP &#215;2</text>
+  <text x="732" y="359" text-anchor="middle" class="box-title">rank-local</text>
+  <text x="732" y="377" text-anchor="middle" class="box-title">loaders</text>
+  <text x="732" y="402" text-anchor="middle" class="box-text">final transforms</text>
+  <text x="732" y="421" text-anchor="middle" class="box-text">publish / join</text>
 
-  <rect x="816" y="310" width="125" height="130" rx="8" class="mapping"/>
-  <text x="878" y="335" text-anchor="middle" class="eyebrow">HOST VIEW</text>
-  <text x="878" y="360" text-anchor="middle" class="box-title">mmap of shared</text>
-  <text x="878" y="378" text-anchor="middle" class="box-title">weight pages</text>
-  <text x="878" y="403" text-anchor="middle" class="box-text">process-local view</text>
-  <text x="878" y="422" text-anchor="middle" class="box-text">optional registration</text>
+  <rect x="795" y="310" width="112" height="130" rx="8" class="mapping"/>
+  <text x="851" y="335" text-anchor="middle" class="eyebrow">HOST VIEWS &#215;2</text>
+  <text x="851" y="359" text-anchor="middle" class="box-title">TP0 mmap</text>
+  <text x="851" y="377" text-anchor="middle" class="box-title">TP1 mmap</text>
+  <text x="851" y="402" text-anchor="middle" class="box-text">process-local</text>
+  <text x="851" y="421" text-anchor="middle" class="box-text">optional registration</text>
 
-  <rect x="959" y="310" width="135" height="130" rx="8" class="hook"/>
-  <text x="1026" y="335" text-anchor="middle" class="eyebrow">RUNTIME CONTROL</text>
-  <text x="1026" y="360" text-anchor="middle" class="box-title">DLO backend</text>
-  <text x="1026" y="378" text-anchor="middle" class="box-title">+ block hook</text>
-  <text x="1026" y="403" text-anchor="middle" class="box-text">select &#183; prefetch</text>
-  <text x="1026" y="422" text-anchor="middle" class="box-text">repoint &#183; rotate</text>
+  <rect x="921" y="310" width="120" height="130" rx="8" class="hook"/>
+  <text x="981" y="335" text-anchor="middle" class="eyebrow">RUNTIME &#215;2</text>
+  <text x="981" y="359" text-anchor="middle" class="box-title">DLO backends</text>
+  <text x="981" y="377" text-anchor="middle" class="box-title">+ block hooks</text>
+  <text x="981" y="402" text-anchor="middle" class="box-text">private streams</text>
+  <text x="981" y="421" text-anchor="middle" class="box-text">events + state</text>
 
-  <rect x="1112" y="310" width="100" height="130" rx="8" class="gpu"/>
-  <text x="1162" y="335" text-anchor="middle" class="eyebrow">GPU B</text>
-  <text x="1162" y="355" text-anchor="middle" class="box-text">two device slots</text>
-  <rect x="1125" y="373" width="74" height="24" rx="5" class="slot-current"/>
-  <text x="1162" y="389" text-anchor="middle" class="slot-text">SLOT 0 &#183; NOW</text>
-  <rect x="1125" y="404" width="74" height="24" rx="5" class="slot-next"/>
-  <text x="1162" y="420" text-anchor="middle" class="slot-next-text">SLOT 1 &#183; NEXT</text>
+  <rect x="1055" y="310" width="157" height="130" rx="8" class="gpu"/>
+  <text x="1133" y="330" text-anchor="middle" class="eyebrow">TWO DEVICES</text>
+  <rect x="1065" y="340" width="137" height="42" rx="6" class="device"/>
+  <text x="1133" y="353" text-anchor="middle" class="device-title">TP0 &#183; GPU B0</text>
+  <rect x="1072" y="359" width="58" height="16" rx="4" class="slot-current"/>
+  <text x="1101" y="370" text-anchor="middle" class="slot-text">SLOT 0 NOW</text>
+  <rect x="1136" y="359" width="58" height="16" rx="4" class="slot-next"/>
+  <text x="1165" y="370" text-anchor="middle" class="slot-next-text">SLOT 1 NEXT</text>
+  <rect x="1065" y="389" width="137" height="42" rx="6" class="device"/>
+  <text x="1133" y="402" text-anchor="middle" class="device-title">TP1 &#183; GPU B1</text>
+  <rect x="1072" y="408" width="58" height="16" rx="4" class="slot-current"/>
+  <text x="1101" y="419" text-anchor="middle" class="slot-text">SLOT 0 NOW</text>
+  <rect x="1136" y="408" width="58" height="16" rx="4" class="slot-next"/>
+  <text x="1165" y="419" text-anchor="middle" class="slot-next-text">SLOT 1 NEXT</text>
 
-  <path d="M 798 375 L 816 375" class="startup-path"/>
-  <path d="M 941 375 L 959 375" class="runtime-path"/>
-  <path d="M 1094 375 L 1112 375" class="runtime-path"/>
+  <path d="M 781 375 L 795 375" class="startup-path"/>
+  <path d="M 907 375 L 921 375" class="runtime-path"/>
+  <path d="M 1041 375 L 1055 375" class="runtime-path"/>
 
   <!-- The runtimes are deliberately not coupled by a DLO collective. -->
   <rect x="365" y="516" width="550" height="44" rx="8" class="no-collective"/>
@@ -153,25 +169,28 @@
   <text x="420" y="551" class="no-text">shared host pages do not couple request order, progress, or failure domains</text>
   <text x="640" y="592" text-anchor="middle" class="section-sub">Ordinary TP / SP model collectives, when configured, remain inside each engine</text>
 
-  <!-- Runtime mmap views point to one physical host payload at the bottom. -->
-  <path d="M 455 650 C 412 625, 340 610, 340 570 L 340 525 C 340 478, 300 454, 263 440" class="mapping-path"/>
-  <text x="300" y="617" text-anchor="middle" class="mapping-label">same pages</text>
-  <path d="M 825 650 C 868 625, 940 610, 940 570 L 940 525 C 940 478, 908 454, 878 440" class="mapping-path"/>
-  <text x="980" y="617" text-anchor="middle" class="mapping-label">same pages</text>
+  <!-- Each engine maps both TP-coordinate payloads from the shared host cache. -->
+  <path d="M 455 650 C 412 625, 340 610, 340 570 L 340 525 C 340 478, 278 454, 236 440" class="mapping-path"/>
+  <text x="286" y="617" text-anchor="middle" class="mapping-label">TP0 + TP1 mappings</text>
+  <path d="M 825 650 C 868 625, 940 610, 940 570 L 940 525 C 940 478, 893 454, 851 440" class="mapping-path"/>
+  <text x="994" y="617" text-anchor="middle" class="mapping-label">TP0 + TP1 mappings</text>
 
   <!-- One node-local physical backing, visually beneath its consumers. -->
   <rect x="58" y="650" width="242" height="140" rx="10" class="scope"/>
   <text x="78" y="676" class="eyebrow">SHARING SCOPE</text>
-  <text x="78" y="702" class="box-title">TP1: one full cache entry</text>
-  <text x="78" y="725" class="box-text">TP&gt;1: one entry per TP coordinate</text>
-  <text x="78" y="746" class="box-text">Equivalent engines reuse that entry;</text>
-  <text x="78" y="767" class="box-text">different TP ranks never alias layouts.</text>
+  <text x="78" y="702" class="box-title">TP2: two coordinate entries</text>
+  <text x="78" y="725" class="box-text">one physical copy per coordinate</text>
+  <text x="78" y="746" class="box-text">A/TP0 + B/TP0 &#8594; TP0 entry</text>
+  <text x="78" y="767" class="box-text">A/TP1 + B/TP1 &#8594; TP1 entry</text>
 
   <rect x="330" y="650" width="620" height="140" rx="10" class="cache"/>
-  <text x="350" y="676" class="eyebrow">NODE-LOCAL IMMUTABLE RUNTIME CACHE</text>
-  <rect x="370" y="692" width="540" height="60" rx="8" class="payload"/>
-  <text x="640" y="717" text-anchor="middle" class="payload-title">1&#215; physical runtime-weight payload</text>
-  <text x="640" y="738" text-anchor="middle" class="payload-text">file-backed tensor pages shared by the OS page cache</text>
+  <text x="350" y="676" class="eyebrow">NODE-LOCAL IMMUTABLE RUNTIME CACHE &#183; ONE COPY PER TP COORDINATE</text>
+  <rect x="370" y="692" width="260" height="60" rx="8" class="payload"/>
+  <text x="500" y="717" text-anchor="middle" class="payload-title">TP0 physical payload</text>
+  <text x="500" y="738" text-anchor="middle" class="payload-text">shared by A/TP0 + B/TP0</text>
+  <rect x="650" y="692" width="260" height="60" rx="8" class="payload"/>
+  <text x="780" y="717" text-anchor="middle" class="payload-title">TP1 physical payload</text>
+  <text x="780" y="738" text-anchor="middle" class="payload-text">shared by A/TP1 + B/TP1</text>
   <text x="640" y="773" text-anchor="middle" class="box-text">Identity includes final layout + TP coordinate; engine and DP replica are excluded</text>
 
   <rect x="980" y="650" width="242" height="140" rx="10" class="scope"/>

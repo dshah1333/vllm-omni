@@ -370,11 +370,13 @@ ordinary runtime tensors.
 
 ![No-AllGather DLO shared host weights and independent runtime orchestration](../../figures/dlo/dlo_no_allgather_shared_host.svg)
 
-The figure uses TP1 to make physical sharing explicit. With TP greater than
-one, the cache keeps one immutable entry per TP coordinate and equivalent
-workers in independent engines map the corresponding entry. An external
-router or orchestrator chooses each engine's requests; DLO coordinates only
-the worker-local mapping, hooks, transfer streams, events, and device slots.
+The figure uses TP2 to make per-coordinate physical sharing explicit. Each
+engine contains two rank-local workers and devices. The cache keeps one
+immutable entry per TP coordinate, so equivalent TP0 workers across engines
+share the TP0 entry and equivalent TP1 workers share the separate TP1 entry.
+An external router or orchestrator chooses each engine's requests; DLO
+coordinates only the worker-local mapping, hooks, transfer streams, events,
+and device slots.
 
 For direct mmap, each process retains immutable safetensors views and uses two
 bounded pinned host staging slots. Processes on the same node that map the same
