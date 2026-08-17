@@ -130,6 +130,8 @@ def test_registration_rolls_back_partial_success(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(registration_module.torch.cuda, "is_available", lambda: True)
     runtime = _FakeRuntime([0, 7])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+    consumed_errors: list[int] = []
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", consumed_errors.append)
 
     with pytest.raises(CudaHostRegistrationError, match="error-7"):
         CudaHostRegistration.create(
@@ -141,6 +143,7 @@ def test_registration_rolls_back_partial_success(monkeypatch: pytest.MonkeyPatch
         )
 
     assert runtime.unregistered == [0x1000]
+    assert consumed_errors == [7]
 
 
 def test_registration_wraps_runtime_exception_and_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -164,6 +167,8 @@ def test_registration_fails_closed_when_rollback_fails(monkeypatch: pytest.Monke
     monkeypatch.setattr(registration_module.torch.cuda, "is_available", lambda: True)
     runtime = _FakeRuntime([0, 7], unregister_results=[9])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+    consumed_errors: list[int] = []
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", consumed_errors.append)
 
     with pytest.raises(CudaHostRegistrationCleanupError, match="rollback errors"):
         CudaHostRegistration.create(
@@ -173,6 +178,35 @@ def test_registration_fails_closed_when_rollback_fails(monkeypatch: pytest.Monke
             },
             max_bytes=8192,
         )
+
+    assert consumed_errors == [7, 9]
+
+
+@pytest.mark.parametrize("pending_error", [0, 801])
+def test_consume_last_cuda_error_accepts_cleared_or_matching_state(
+    monkeypatch: pytest.MonkeyPatch,
+    pending_error: int,
+) -> None:
+    class _GetLastError:
+        def __call__(self) -> int:
+            return pending_error
+
+    runtime = SimpleNamespace(cudaGetLastError=_GetLastError())
+    monkeypatch.setattr(registration_module.ctypes, "CDLL", lambda _name: runtime)
+
+    registration_module._consume_last_cuda_error(801)
+
+
+def test_consume_last_cuda_error_rejects_unrelated_pending_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _GetLastError:
+        def __call__(self) -> int:
+            return 700
+
+    runtime = SimpleNamespace(cudaGetLastError=_GetLastError())
+    monkeypatch.setattr(registration_module.ctypes, "CDLL", lambda _name: runtime)
+
+    with pytest.raises(CudaHostRegistrationCleanupError, match="cudaGetLastError reported 700"):
+        registration_module._consume_last_cuda_error(801)
 
 
 def test_registration_closes_all_coalesced_ranges(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,6 +253,8 @@ def test_registration_close_retries_failed_ranges(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(registration_module.torch.cuda, "is_available", lambda: True)
     runtime = _FakeRuntime([0], unregister_results=[9, 0])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+    consumed_errors: list[int] = []
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", consumed_errors.append)
     registration = CudaHostRegistration.create(
         {"weights": [_FakeTensor(0x1003, 1)]},  # type: ignore[list-item]
         max_bytes=4096,
@@ -227,3 +263,4 @@ def test_registration_close_retries_failed_ranges(monkeypatch: pytest.MonkeyPatc
     assert registration.close() == ["cudaHostUnregister(0x1000) failed: error-9"]
     assert registration.close() == []
     assert runtime.unregistered == [0x1000, 0x1000]
+    assert consumed_errors == [9]

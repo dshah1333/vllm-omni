@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import mmap
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -99,6 +100,39 @@ def _error_message(runtime: _CudaRuntime, error: int) -> str:
     return str(message)
 
 
+def _consume_last_cuda_error(expected_error: int) -> None:
+    """Clear a handled CUDA Runtime error before returning to PyTorch.
+
+    PyTorch's ``torch.cuda.cudart()`` binding exposes host registration but not
+    ``cudaGetLastError``. Resolve the already-loaded process symbol so this call
+    clears the same CUDA Runtime instance that produced the registration error.
+    A different pending error is not safe to hide behind the staging fallback.
+    """
+    try:
+        get_last_error = ctypes.CDLL(None).cudaGetLastError
+        get_last_error.argtypes = []
+        get_last_error.restype = ctypes.c_int
+        pending_error = int(get_last_error())
+    except (AttributeError, OSError) as exc:
+        raise HostRegistrationCleanupError("cannot clear CUDA's pending error after host-registration failure") from exc
+
+    if pending_error not in (0, expected_error):
+        raise HostRegistrationCleanupError(
+            f"host registration returned CUDA error {expected_error}, but cudaGetLastError reported {pending_error}"
+        )
+
+
+def _handled_error_message(runtime: _CudaRuntime, error: int) -> str:
+    """Format and consume one nonzero CUDA Runtime return code."""
+    error_code = int(error)
+    message = _error_message(runtime, error)
+    try:
+        _consume_last_cuda_error(error_code)
+    except HostRegistrationCleanupError as exc:
+        raise HostRegistrationCleanupError(f"{message}; {exc}") from exc
+    return message
+
+
 class CudaHostRegistration:
     """Own CUDA registrations for already-existing file-backed CPU tensors."""
 
@@ -147,7 +181,7 @@ class CudaHostRegistration:
                 if int(error) != 0:
                     raise HostRegistrationError(
                         "cudaHostRegister(read-only) failed for "
-                        f"[{region.start:#x}, {region.end:#x}): {_error_message(runtime, error)}"
+                        f"[{region.start:#x}, {region.end:#x}): {_handled_error_message(runtime, error)}"
                     )
                 registered.append(region)
 
@@ -167,7 +201,7 @@ class CudaHostRegistration:
                     error = runtime.cudaHostUnregister(region.start)
                     if int(error) != 0:
                         rollback_errors.append(
-                            f"cudaHostUnregister({region.start:#x}) failed: {_error_message(runtime, error)}"
+                            f"cudaHostUnregister({region.start:#x}) failed: {_handled_error_message(runtime, error)}"
                         )
                 except Exception as rollback_exc:
                     rollback_errors.append(f"cudaHostUnregister({region.start:#x}) raised: {rollback_exc}")
@@ -200,7 +234,7 @@ class CudaHostRegistration:
                 error = self._runtime.cudaHostUnregister(region.start)
                 if int(error) != 0:
                     errors.append(
-                        f"cudaHostUnregister({region.start:#x}) failed: {_error_message(self._runtime, error)}"
+                        f"cudaHostUnregister({region.start:#x}) failed: {_handled_error_message(self._runtime, error)}"
                     )
                     failed.append(region)
             except Exception as exc:
