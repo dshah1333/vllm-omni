@@ -43,7 +43,6 @@ vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --tensor-parallel-size 2 \
   --dlo-no-use-allgather \
-  --dlo-enable-host-weight-cache \
   --dlo-host-weight-cache-pin-limit-gib 80
 ```
 
@@ -53,14 +52,15 @@ vllm serve /path/to/model --omni \
 | --- | --- | --- |
 | `--enable-distributed-layerwise-offload` | Enable DLO | `false` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks independently | `false` |
-| `--dlo-enable-host-weight-cache` | Share final no-AllGather DiT weights through a node-local mmap cache | `false` |
 | `--dlo-host-weight-cache-pin-limit-gib GIB` | Per-worker registration budget; zero uses bounded host staging | `0` |
 | `--dlo-resident-layers N` | Keep eligible leading DiT blocks resident in HBM | `0` |
 
-The host weight cache uses `~/.cache/vllm-omni/dlo-host-weights`. Programmatic
-configuration may override `dlo_host_weight_cache_dir` and the writer lock
-timeout; these advanced storage controls are intentionally not separate CLI
-flags.
+No-AllGather DLO automatically uses a compatible checkpoint mmap plan, or
+builds/joins the final-layout host weight cache after ordinary loading when a
+checkpoint plan is unavailable. The cache uses
+`~/.cache/vllm-omni/dlo-host-weights`. Programmatic configuration may override
+`dlo_host_weight_cache_dir` and the writer lock timeout; these advanced storage
+controls are intentionally not separate CLI flags.
 
 ## Operational notes
 

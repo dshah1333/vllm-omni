@@ -19,13 +19,14 @@ DLO weight collective.
 
 Host storage is selected separately from the transfer protocol. The loader can
 produce a direct-checkpoint mmap plan for a proven-compatible runtime layout;
-otherwise it uses the ordinary loader. In no-AllGather mode, an opt-in Phase B
-host weight cache can normalize those final ordinary-loader DiT tensors into an
-immutable node-local mmap entry. Consequently, replicas can share either
-proven-compatible checkpoint pages or equivalent final runtime layouts. An
-opt-in host-registration budget can make the complete final mapping directly
-H2D-copyable when the platform provides a backend, avoiding the recurrent host
-packing otherwise required by mmap. CUDA is the first implementation.
+otherwise it uses the ordinary loader. In no-AllGather mode, the Phase B host
+weight cache automatically normalizes supported final ordinary-loader DiT
+tensors into an immutable node-local mmap entry. Consequently, replicas can
+share either proven-compatible checkpoint pages or equivalent final runtime
+layouts. An opt-in host-registration budget can make the complete final mapping
+directly H2D-copyable when the platform provides a backend, avoiding the
+recurrent host packing otherwise required by mmap. CUDA is the first
+implementation.
 
 The Phase A shared-mmap support boundary is TP1. TP greater than one is an
 ordinary-loader compatibility path: DLO can consume the resulting TP-local
@@ -104,14 +105,14 @@ flowchart TB
 | `DiffusionWorker` | Calling backend teardown before destroying the distributed environment | Managing backend-owned mappings or registrations directly |
 
 The configuration fields are routed to the component that can enforce their
-contract. `dlo_enable_host_weight_cache`, its cache root, and lock timeout are
-consumed by the loader. `dlo_host_weight_cache_pin_limit_gib` is also visible
-while loading because a positive value deliberately selects the
-transform-complete host weight cache; the backend later consumes the same
-budget for registration. `dlo_use_allgather` controls loader plan routing
-because the host weight cache is no-AllGather-only, and it selects the backend
-transfer protocol. This is coordination through typed configuration and
-`HostWeightPlan`, not through model-specific global state.
+contract. The cache root and lock timeout are consumed by the loader.
+`dlo_host_weight_cache_pin_limit_gib` is also visible while loading because a
+positive value deliberately selects the transform-complete host weight cache;
+the backend later consumes the same budget for registration.
+`dlo_use_allgather` controls loader plan routing because the host weight cache
+is no-AllGather-only, and it selects the backend transfer protocol. This is
+coordination through typed configuration and `HostWeightPlan`, not through
+model-specific global state.
 
 ### Shared startup and lifecycle
 
@@ -400,8 +401,8 @@ or failed registration retains the bounded staging behavior.
 
 When direct mmap preflight fails, the regular model loader remains responsible
 for preparing each rank's weights, including TP-local tensors or HSDP-managed
-parameters. Supported CPU layouts may then enter the opt-in host weight cache.
-Unsupported layouts keep one private runtime copy per process.
+parameters. Supported CPU layouts then enter the host weight cache
+automatically. Unsupported layouts keep one private runtime copy per process.
 
 This mode means:
 
@@ -419,9 +420,10 @@ This mode means:
 ### Post-load host weight cache
 
 The Phase B cache preserves the same ownership boundary. DLO neither derives
-cache keys nor interprets model loaders. When enabled with no-AllGather, every
-rank first completes the ordinary loader, custom callbacks, post-load
-processing, strict validation, and calibration. The loader then:
+cache keys nor interprets model loaders. No-AllGather DLO first attempts a
+compatible direct-checkpoint mmap plan. When that plan is unavailable, every
+rank completes the ordinary loader, custom callbacks, post-load processing,
+strict validation, and calibration. The loader then automatically:
 
 1. discovers final CPU DiT parameters and persistent buffers;
 2. rejects unsupported non-contiguous, aliased, quantized, distributed, or
@@ -457,9 +459,10 @@ model-sized private pinned storage, but adds a recurrent host-to-host copy and
 can amplify TP synchronization waits when several ranks compete for host
 bandwidth.
 
-This version is deliberately opt-in and steady-state-oriented. It requires
-roughly one local-disk model copy per runtime identity, has no eviction, and
-still performs ordinary loading plus full content-hash passes in every rank.
+This version is deliberately steady-state-oriented. It requires roughly one
+local-disk model copy per runtime identity, has no eviction, and still performs
+ordinary loading plus full content-hash passes in every rank. Cache publication
+or validation failure falls back to the already-valid ordinary host tensors.
 Skip-load-on-hit is a separate follow-up after loader side effects can be
 modeled safely.
 

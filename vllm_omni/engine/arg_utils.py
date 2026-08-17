@@ -543,7 +543,6 @@ class OrchestratorArgs:
     enable_layerwise_offload: bool = False
     enable_distributed_layerwise_offload: bool = False
     dlo_use_allgather: bool = True
-    dlo_enable_host_weight_cache: bool = False
     dlo_host_weight_cache_dir: str | None = None
     dlo_host_weight_cache_lock_timeout: float = 600.0
     dlo_host_weight_cache_pin_limit_gib: float = 0.0

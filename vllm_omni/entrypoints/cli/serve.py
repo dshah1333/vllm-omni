@@ -723,15 +723,6 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
-            "--dlo-enable-host-weight-cache",
-            action="store_true",
-            help=(
-                "After ordinary loading, publish or join a node-local mmap cache "
-                "for final DiT weights. This first version requires "
-                "--dlo-no-use-allgather."
-            ),
-        )
-        omni_config_group.add_argument(
             "--dlo-host-weight-cache-pin-limit-gib",
             type=float,
             default=0.0,

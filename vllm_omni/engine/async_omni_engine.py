@@ -1000,7 +1000,6 @@ class AsyncOmniEngine:
             "enable_layerwise_offload": kwargs.get("enable_layerwise_offload", False),
             "enable_distributed_layerwise_offload": kwargs.get("enable_distributed_layerwise_offload", False),
             "dlo_use_allgather": kwargs.get("dlo_use_allgather", True),
-            "dlo_enable_host_weight_cache": kwargs.get("dlo_enable_host_weight_cache", False),
             "dlo_host_weight_cache_dir": kwargs.get("dlo_host_weight_cache_dir", None),
             "dlo_host_weight_cache_lock_timeout": kwargs.get("dlo_host_weight_cache_lock_timeout", 600.0),
             "dlo_host_weight_cache_pin_limit_gib": kwargs.get("dlo_host_weight_cache_pin_limit_gib", 0.0),

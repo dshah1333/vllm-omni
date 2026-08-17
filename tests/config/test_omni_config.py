@@ -785,6 +785,19 @@ def test_structured_diffusion_config_rejects_invalid_compile_granularity():
         omni_config_module._DiffusionConfigProjection(diffusion_compile_granularity="block")
 
 
+@pytest.mark.parametrize(
+    ("enable_dlo", "use_allgather"),
+    [(False, False), (True, True)],
+)
+def test_structured_diffusion_config_restricts_host_weight_registration_to_no_allgather_dlo(enable_dlo, use_allgather):
+    with pytest.raises(ValueError, match="requires no-AllGather distributed layerwise offload"):
+        omni_config_module._DiffusionConfigProjection(
+            enable_distributed_layerwise_offload=enable_dlo,
+            dlo_use_allgather=use_allgather,
+            dlo_host_weight_cache_pin_limit_gib=1.0,
+        )
+
+
 def test_from_pipeline_config_matches_stage_config_to_omegaconf_behavior_for_representative_stage():
     pipeline = _resolve_pipeline_or_skip("qwen3_tts")
     legacy_stage = merge_pipeline_deploy(pipeline, _load_default_deploy(pipeline))[0]

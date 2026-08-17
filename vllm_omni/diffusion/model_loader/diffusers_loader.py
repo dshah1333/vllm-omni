@@ -444,7 +444,6 @@ class DiffusersPipelineLoader:
                 _prefer_registered_host_weight_cache = (
                     _dist_offload
                     and not _use_ag
-                    and bool(getattr(self.od_config, "dlo_enable_host_weight_cache", False))
                     and float(getattr(self.od_config, "dlo_host_weight_cache_pin_limit_gib", 0.0)) > 0
                 )
 
@@ -544,10 +543,7 @@ class DiffusersPipelineLoader:
             return
         if not getattr(self.od_config, "enable_distributed_layerwise_offload", False):
             return
-        if not getattr(self.od_config, "dlo_enable_host_weight_cache", False):
-            return
         if getattr(self.od_config, "dlo_use_allgather", True):
-            logger.info("DLO host weight cache is no-AllGather only; leaving AllGather storage unchanged")
             return
 
         parallel_config = self.parallel_config
