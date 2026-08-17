@@ -723,6 +723,14 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--dlo-use-host-weight-cache",
+            action="store_true",
+            help=(
+                "Use the node-local final-layout host weight cache when direct checkpoint mmap is unavailable. "
+                "This trades recurrent host staging work for shared host pages unless direct registration succeeds."
+            ),
+        )
+        omni_config_group.add_argument(
             "--dlo-host-weight-cache-pin-limit-gib",
             type=float,
             default=0.0,

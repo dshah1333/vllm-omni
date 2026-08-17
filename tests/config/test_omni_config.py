@@ -789,12 +789,24 @@ def test_structured_diffusion_config_rejects_invalid_compile_granularity():
     ("enable_dlo", "use_allgather"),
     [(False, False), (True, True)],
 )
-def test_structured_diffusion_config_restricts_host_weight_registration_to_no_allgather_dlo(enable_dlo, use_allgather):
+@pytest.mark.parametrize(
+    ("field_name", "field_value"),
+    [
+        ("dlo_use_host_weight_cache", True),
+        ("dlo_host_weight_cache_pin_limit_gib", 1.0),
+    ],
+)
+def test_structured_diffusion_config_restricts_host_weight_cache_to_no_allgather_dlo(
+    enable_dlo,
+    use_allgather,
+    field_name,
+    field_value,
+):
     with pytest.raises(ValueError, match="requires no-AllGather distributed layerwise offload"):
         omni_config_module._DiffusionConfigProjection(
             enable_distributed_layerwise_offload=enable_dlo,
             dlo_use_allgather=use_allgather,
-            dlo_host_weight_cache_pin_limit_gib=1.0,
+            **{field_name: field_value},
         )
 
 

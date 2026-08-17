@@ -545,6 +545,14 @@ class DiffusersPipelineLoader:
             return
         if getattr(self.od_config, "dlo_use_allgather", True):
             return
+        if not (
+            getattr(self.od_config, "dlo_use_host_weight_cache", False)
+            or float(getattr(self.od_config, "dlo_host_weight_cache_pin_limit_gib", 0.0)) > 0
+        ):
+            logger.info(
+                "DLO host weight cache not selected; retaining ordinary host tensors after checkpoint mmap fallback"
+            )
+            return
 
         parallel_config = self.parallel_config
         tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1))

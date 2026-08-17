@@ -708,6 +708,10 @@ class OmniDiffusionConfig:
     # This avoids AllGather synchronization, while host memory follows the
     # loader's existing rank-local layout instead of adding a second DP shard.
     dlo_use_allgather: bool = True
+    # Opt into publishing/joining the final-layout host weight cache when a
+    # compatible direct-checkpoint mmap plan is unavailable. A positive pin
+    # limit also selects the cache because registration requires its layout.
+    dlo_use_host_weight_cache: bool = False
     # Shared local-disk root. None selects ~/.cache/vllm-omni/dlo-host-weights.
     dlo_host_weight_cache_dir: str | None = None
     # Maximum wait for the per-layout POSIX writer lock.
@@ -943,6 +947,8 @@ class OmniDiffusionConfig:
             not self.enable_distributed_layerwise_offload or self.dlo_use_allgather
         ):
             raise ValueError("dlo_host_weight_cache_pin_limit_gib requires no-AllGather distributed layerwise offload")
+        if self.dlo_use_host_weight_cache and (not self.enable_distributed_layerwise_offload or self.dlo_use_allgather):
+            raise ValueError("dlo_use_host_weight_cache requires no-AllGather distributed layerwise offload")
         if self.diffusion_compile_granularity not in {"regional", "full"}:
             raise ValueError(
                 "diffusion_compile_granularity must be 'regional' or 'full', "

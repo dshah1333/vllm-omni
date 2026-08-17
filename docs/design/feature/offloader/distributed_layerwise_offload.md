@@ -20,10 +20,12 @@ DLO weight collective.
 Host storage is selected separately from the transfer protocol. The loader can
 produce a direct-checkpoint mmap plan for a proven-compatible runtime layout;
 otherwise it uses the ordinary loader. In no-AllGather mode, the Phase B host
-weight cache automatically normalizes supported final ordinary-loader DiT
-tensors into an immutable node-local mmap entry. Consequently, replicas can
-share either proven-compatible checkpoint pages or equivalent final runtime
-layouts. An opt-in host-registration budget can make the complete final mapping
+weight cache can explicitly normalize supported final ordinary-loader DiT
+tensors into an immutable node-local mmap entry. Ordinary pinned weights remain
+the default after checkpoint mmap fallback because bounded cache staging can
+reduce throughput. Replicas can share either proven-compatible checkpoint pages
+or, when selected, equivalent final runtime layouts. An opt-in
+host-registration budget can make the complete final mapping
 directly H2D-copyable when the platform provides a backend, avoiding the
 recurrent host packing otherwise required by mmap. CUDA is the first
 implementation.
@@ -106,9 +108,12 @@ flowchart TB
 
 The configuration fields are routed to the component that can enforce their
 contract. The cache root and lock timeout are consumed by the loader.
+`dlo_use_host_weight_cache` explicitly selects final-layout cache publication
+after direct-checkpoint mmap fallback. It defaults to false so the ordinary
+pinned-loader path remains available without requiring an opt-out.
 `dlo_host_weight_cache_pin_limit_gib` is also visible while loading because a
-positive value deliberately selects the transform-complete host weight cache;
-the backend later consumes the same budget for registration.
+positive value also deliberately selects the transform-complete host weight
+cache; the backend later consumes the same budget for registration.
 `dlo_use_allgather` controls loader plan routing because the host weight cache
 is no-AllGather-only, and it selects the backend transfer protocol. This is
 coordination through typed configuration and `HostWeightPlan`, not through
@@ -401,8 +406,10 @@ or failed registration retains the bounded staging behavior.
 
 When direct mmap preflight fails, the regular model loader remains responsible
 for preparing each rank's weights, including TP-local tensors or HSDP-managed
-parameters. Supported CPU layouts then enter the host weight cache
-automatically. Unsupported layouts keep one private runtime copy per process.
+parameters. Those ordinary pinned tensors remain the default. When the host
+weight cache or a positive registration budget is explicitly selected,
+supported CPU layouts enter the cache; unsupported layouts keep one private
+runtime copy per process.
 
 This mode means:
 
@@ -423,7 +430,8 @@ The Phase B cache preserves the same ownership boundary. DLO neither derives
 cache keys nor interprets model loaders. No-AllGather DLO first attempts a
 compatible direct-checkpoint mmap plan. When that plan is unavailable, every
 rank completes the ordinary loader, custom callbacks, post-load processing,
-strict validation, and calibration. The loader then automatically:
+strict validation, and calibration. When cache use or registration is
+explicitly selected, the loader:
 
 1. discovers final CPU DiT parameters and persistent buffers;
 2. rejects unsupported non-contiguous, aliased, quantized, distributed, or

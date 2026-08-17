@@ -38,6 +38,12 @@ vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
   --dlo-no-use-allgather
 
+# Share final host weights with bounded pinned staging
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
+  --dlo-use-host-weight-cache
+
 # Share final host weights and register up to 80 GiB per worker for direct H2D
 vllm serve /path/to/model --omni \
   --enable-distributed-layerwise-offload \
@@ -52,12 +58,15 @@ vllm serve /path/to/model --omni \
 | --- | --- | --- |
 | `--enable-distributed-layerwise-offload` | Enable DLO | `false` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks independently | `false` |
-| `--dlo-host-weight-cache-pin-limit-gib GIB` | Per-worker registration budget; zero uses bounded host staging | `0` |
+| `--dlo-use-host-weight-cache` | Use the final-layout cache after checkpoint mmap fallback | `false` |
+| `--dlo-host-weight-cache-pin-limit-gib GIB` | Per-worker registration budget; positive values also select the cache | `0` |
 | `--dlo-resident-layers N` | Keep eligible leading DiT blocks resident in HBM | `0` |
 
-No-AllGather DLO automatically uses a compatible checkpoint mmap plan, or
-builds/joins the final-layout host weight cache after ordinary loading when a
-checkpoint plan is unavailable. The cache uses
+No-AllGather DLO automatically uses a compatible checkpoint mmap plan. When
+checkpoint mmap is unavailable, it preserves ordinary pinned loader weights by
+default. `--dlo-use-host-weight-cache` explicitly selects the final-layout
+cache with bounded staging; a positive registration budget also selects the
+cache and attempts direct H2D. The cache uses
 `~/.cache/vllm-omni/dlo-host-weights`. Programmatic configuration may override
 `dlo_host_weight_cache_dir` and the writer lock timeout; these advanced storage
 controls are intentionally not separate CLI flags.
@@ -68,6 +77,10 @@ controls are intentionally not separate CLI flags.
   directory. Do not use tmpfs or a cross-node filesystem for this version.
 - Cache entries are immutable and validated before use. A cache or registration
   failure keeps the ordinary loader weights or falls back to bounded staging.
+- The bounded-staging cache is a memory-first mode: recurrent pageable-mmap to
+  pinned-slot copies can reduce throughput, especially across concurrent TP
+  engines. Keep ordinary pinned weights unless the host-memory saving is worth
+  that tradeoff, or use a validated registered path.
 - A positive registration budget must cover the complete page-aligned mapping
   reported in the worker log. Registration is all-or-nothing.
 - CUDA is the first registration backend. Platforms without an equivalent

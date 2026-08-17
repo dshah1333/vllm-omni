@@ -364,7 +364,7 @@ def test_dlo_plan_loads_component_sources_outside_planned_dit(monkeypatch):
     assert loader.take_host_weight_plan() is plan
 
 
-def test_dlo_plan_fallback_runs_ordinary_loader_then_cache(monkeypatch):
+def test_dlo_plan_fallback_retains_ordinary_loader_weights_by_default(monkeypatch):
     import vllm_omni.diffusion.model_loader.diffusers_loader as loader_mod
     import vllm_omni.diffusion.model_loader.host_weight_cache as cache_mod
 
@@ -391,14 +391,13 @@ def test_dlo_plan_fallback_runs_ordinary_loader_then_cache(monkeypatch):
         lambda *_args, **_kwargs: HostWeightPlanResult(None, "not direct-compatible"),
     )
 
-    def build_cache(_pipeline, **_kwargs):
-        calls.append("cache")
-        return HostWeightPlanResult(None, "unsupported test layout", "unsupported_layout")
+    def build_cache(*_args, **_kwargs):
+        pytest.fail("host weight cache must require explicit selection")
 
     monkeypatch.setattr(cache_mod, "build_host_weight_cache_plan", build_cache)
 
     assert loader.load_model(load_device="cpu") is model
-    assert calls == ["load", "process", "cache"]
+    assert calls == ["load", "process"]
     assert loader.take_host_weight_plan() is None
 
 
@@ -423,6 +422,7 @@ def test_dlo_host_weight_cache_is_built_after_final_post_load_mutation(monkeypat
         quantization_config=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
+        dlo_use_host_weight_cache=True,
         dlo_host_weight_cache_dir=str(tmp_path),
         dlo_host_weight_cache_lock_timeout=1.0,
         model="unused",
@@ -556,6 +556,7 @@ def test_dlo_host_weight_cache_failure_retains_ordinary_weights(monkeypatch, tmp
         quantization_config=None,
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=False,
+        dlo_use_host_weight_cache=True,
         dlo_host_weight_cache_dir=str(tmp_path),
         model="unused",
     )
