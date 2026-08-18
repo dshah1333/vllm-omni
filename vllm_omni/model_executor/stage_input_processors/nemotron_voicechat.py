@@ -41,6 +41,7 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes", "codes.audio", 
 # stt pad_token. The thinker also reports it in its latent metadata, which
 # takes precedence when present.
 _DEFAULT_TEXT_PAD_ID = 12
+_NVC_CUM_CODES: dict = {}
 _STEP_TOKEN_SNAPSHOT_MISSING = object()
 
 
@@ -264,6 +265,15 @@ def talker2code2wav_async_chunk(
         )
     if codes.ndim == 1:
         codes = codes.reshape(1, -1)
+    if codec_streaming:
+        # Public vLLM 0.27 delivers only the newest talker code row per wake;
+        # the prompt-region trim below assumes cumulative payloads. Rebuild
+        # the cumulative stack so the trim ships real content rows.
+        _cum = _NVC_CUM_CODES.get(request_id)
+        if _cum is not None and codes.shape[0] <= _cum.shape[0]:
+            codes = torch.cat([_cum.to(codes.device, dtype=codes.dtype), codes], dim=0)
+        _NVC_CUM_CODES[request_id] = codes.detach()
+
     # Prompt-region trim (rows are NeMo timeline steps t=1..; keep t >= P).
     # Read the prompt length from the PER-STEP model payload first: the
     # request-level additional_information is overwritten both by arriving
