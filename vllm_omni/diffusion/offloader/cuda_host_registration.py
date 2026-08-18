@@ -19,6 +19,7 @@ from .host_registration import (
 )
 
 _CUDA_HOST_REGISTER_READ_ONLY = 0x08
+_CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED = 113
 
 CudaHostRegistrationError = HostRegistrationError
 CudaHostRegistrationBudgetError = HostRegistrationBudgetError
@@ -133,6 +134,37 @@ def _handled_error_message(runtime: _CudaRuntime, error: int) -> str:
     return message
 
 
+def _supports_read_only_host_registration(runtime: _CudaRuntime) -> bool:
+    """Query support required by immutable file-backed cache mappings."""
+    try:
+        get_attribute = getattr(runtime, "cudaDeviceGetAttribute", None)
+        if get_attribute is None:
+            get_attribute = ctypes.CDLL(None).cudaDeviceGetAttribute
+            get_attribute.argtypes = [
+                ctypes.POINTER(ctypes.c_int),
+                ctypes.c_int,
+                ctypes.c_int,
+            ]
+            get_attribute.restype = ctypes.c_int
+    except (AttributeError, OSError) as exc:
+        raise HostRegistrationError("cannot query CUDA read-only host-registration support") from exc
+
+    supported = ctypes.c_int()
+    try:
+        error = get_attribute(
+            ctypes.byref(supported),
+            _CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED,
+            torch.accelerator.current_device_index(),
+        )
+    except Exception as exc:
+        raise HostRegistrationError(f"cannot query CUDA read-only host-registration support: {exc}") from exc
+    if int(error) != 0:
+        raise HostRegistrationError(
+            f"cudaDeviceGetAttribute(read-only host registration) failed: {_handled_error_message(runtime, error)}"
+        )
+    return bool(supported.value)
+
+
 class CudaHostRegistration:
     """Own CUDA registrations for already-existing file-backed CPU tensors."""
 
@@ -169,6 +201,11 @@ class CudaHostRegistration:
             runtime = torch.cuda.cudart()
         except Exception as exc:
             raise HostRegistrationError(f"cannot access the CUDA runtime: {exc}") from exc
+        if not _supports_read_only_host_registration(runtime):
+            raise HostRegistrationError(
+                "CUDA device does not support read-only host registration required by immutable "
+                "host weight cache mappings"
+            )
 
         registered: list[_AddressRange] = []
         try:

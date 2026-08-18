@@ -83,8 +83,10 @@ controls are intentionally not separate CLI flags.
   that tradeoff, or use a validated registered path.
 - A positive registration budget must cover the complete page-aligned mapping
   reported in the worker log. Registration is all-or-nothing.
-- CUDA is the first registration backend. Platforms without an equivalent
-  implementation continue to use bounded staging.
+- CUDA is the first registration backend and requires read-only host
+  registration support for immutable cache mappings. Platforms or devices
+  without that capability continue to use bounded staging; a positive budget
+  requests direct H2D but does not guarantee it.
 - Registration is process-local but does not duplicate the underlying file
   pages. Each worker must still satisfy its platform and OS page-locking limits.
 - Shutdown unregisters host ranges before closing their mmap handles.

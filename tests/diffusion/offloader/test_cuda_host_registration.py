@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from types import SimpleNamespace
 
 import pytest
@@ -58,11 +59,22 @@ class _FakeRuntime:
         self,
         register_results: list[int | Exception],
         unregister_results: list[int | Exception] | None = None,
+        *,
+        read_only_registration_supported: bool = True,
+        attribute_result: int = 0,
     ) -> None:
         self._register_results = iter(register_results)
         self._unregister_results = iter(unregister_results or [])
+        self._read_only_registration_supported = read_only_registration_supported
+        self._attribute_result = attribute_result
+        self.attribute_queries: list[tuple[int, int]] = []
         self.registered: list[tuple[int, int, int]] = []
         self.unregistered: list[int] = []
+
+    def cudaDeviceGetAttribute(self, value, attribute: int, device: int) -> int:
+        self.attribute_queries.append((attribute, device))
+        ctypes.cast(value, ctypes.POINTER(ctypes.c_int)).contents.value = int(self._read_only_registration_supported)
+        return self._attribute_result
 
     def cudaHostRegister(self, pointer: int, size: int, flags: int) -> int:
         self.registered.append((pointer, size, flags))
@@ -81,6 +93,11 @@ class _FakeRuntime:
     @staticmethod
     def cudaGetErrorString(error: int) -> str:
         return f"error-{error}"
+
+
+@pytest.fixture(autouse=True)
+def _current_cuda_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registration_module.torch.accelerator, "current_device_index", lambda: 0)
 
 
 def test_platform_factory_reports_unsupported_registration() -> None:
@@ -123,6 +140,40 @@ def test_registration_rejects_over_budget_before_calling_cuda(monkeypatch: pytes
             max_bytes=4096,
         )
 
+    assert runtime.registered == []
+
+
+def test_registration_rejects_unsupported_read_only_mapping(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registration_module.torch.cuda, "is_available", lambda: True)
+    runtime = _FakeRuntime([0], read_only_registration_supported=False)
+    monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+
+    with pytest.raises(CudaHostRegistrationError, match="does not support read-only host registration"):
+        CudaHostRegistration.create(
+            {"weights": [_FakeTensor(0x1003, 1)]},  # type: ignore[list-item]
+            max_bytes=4096,
+        )
+
+    assert runtime.attribute_queries == [
+        (registration_module._CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED, 0)
+    ]
+    assert runtime.registered == []
+
+
+def test_registration_consumes_capability_query_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(registration_module.torch.cuda, "is_available", lambda: True)
+    runtime = _FakeRuntime([0], attribute_result=7)
+    monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+    consumed_errors: list[int] = []
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", consumed_errors.append)
+
+    with pytest.raises(CudaHostRegistrationError, match="error-7"):
+        CudaHostRegistration.create(
+            {"weights": [_FakeTensor(0x1003, 1)]},  # type: ignore[list-item]
+            max_bytes=4096,
+        )
+
+    assert consumed_errors == [7]
     assert runtime.registered == []
 
 

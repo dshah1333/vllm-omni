@@ -518,12 +518,15 @@ After mapping and validating every final tensor, DLO groups source storages by
 backing file, page-aligns their address ranges, and coalesces overlapping or
 adjacent ranges within that mapping. The complete byte count is checked
 against the per-worker budget before any platform mutation. The CUDA backend
-then registers every range with the read-only host-registration flag and
-verifies that PyTorch recognizes every mapped tensor as pinned. Failure rolls
-back any ranges already registered and preserves the existing two-slot staging
-path. Partial direct transfer is deliberately unsupported. A rollback failure
-aborts worker initialization so a still-registered range is retained until
-process/context teardown rather than being unsafely unmapped.
+first requires `cudaDevAttrHostRegisterReadOnlySupported`, then registers every
+range with the read-only host-registration flag and verifies that PyTorch
+recognizes every mapped tensor as pinned. A device without that capability
+retains bounded staging; vLLM-Omni does not replace immutable mappings with a
+writable or copy-on-write CUDA-specific layout. Other registration failures
+roll back any ranges already registered and preserve the existing two-slot
+staging path. Partial direct transfer is deliberately unsupported. A rollback
+failure aborts worker initialization so a still-registered range is retained
+until process/context teardown rather than being unsafely unmapped.
 
 On success, the hooks copy each immutable tensor view directly into its offset
 in the existing flattened rotating device buffer on the copy stream. Parameter
