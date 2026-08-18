@@ -394,9 +394,12 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
         request_id = require_request_id(info, "talker")
 
         embeds = torch.zeros((span, self._hidden), device=device, dtype=self._dtype)
-        if is_prefill or request_id not in self._sessions:
+        if request_id not in self._sessions:
             # The 1-token vLLM prefill is the session boundary: run the vendored
             # warmup here so the first decode step is a pure NeMo t=1 step.
+            # Public vLLM 0.27 re-presents resumable duplex wakes as prefills;
+            # only a genuinely unknown request starts a session, a re-prefill
+            # wake falls through to refresh+drain below.
             self._init_session(request_id, info, device)
             return input_ids, embeds, {}
 
