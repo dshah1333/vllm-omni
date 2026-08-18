@@ -172,6 +172,16 @@ def thinker2talker_async_chunk(
         # vLLM prompt = logical prompt + 1 placeholder (acoustic frame 0).
         logical_prompt_len = max(len(prompt_ids) - 1, 0)
         generated = generated_now
+    if is_duplex:
+        # Public vLLM 0.27: the step snapshot and output_token_ids are both
+        # unreliable across resumable re-prefill wakes; rebuild the timeline
+        # from engine-accepted tokens. Drop a constant non-pad leading token
+        # (the placeholder-prompt sample accepted before frame decoding).
+        from vllm_omni.model_executor.models.nemotron_voicechat import duplex_text_tap as _tap
+        _tapped = _tap.get(request_id) or _tap.get(str(getattr(request, 'request_id', '')))
+        if _tapped:
+            _lead = _tapped[0]
+            generated = _tapped if _lead == _DEFAULT_TEXT_PAD_ID else [_t for _t in _tapped if _t != _lead]
     pad_id = _DEFAULT_TEXT_PAD_ID
     reported_pad = _info_get(request_info, "nvc_text_pad_id")
     if reported_pad is not None:
@@ -254,7 +264,6 @@ def talker2code2wav_async_chunk(
         )
     if codes.ndim == 1:
         codes = codes.reshape(1, -1)
-
     # Prompt-region trim (rows are NeMo timeline steps t=1..; keep t >= P).
     # Read the prompt length from the PER-STEP model payload first: the
     # request-level additional_information is overwritten both by arriving
