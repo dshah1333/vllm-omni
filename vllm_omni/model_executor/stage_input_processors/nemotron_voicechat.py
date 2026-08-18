@@ -181,8 +181,10 @@ def thinker2talker_async_chunk(
         from vllm_omni.model_executor.models.nemotron_voicechat import duplex_text_tap as _tap
         _tapped = _tap.get(request_id) or _tap.get(str(getattr(request, 'request_id', '')))
         if _tapped:
-            _lead = _tapped[0]
-            generated = _tapped if _lead == _DEFAULT_TEXT_PAD_ID else [_t for _t in _tapped if _t != _lead]
+            # Drop only the leading placeholder sample; filtering every
+            # occurrence of its token id would delete legitimate later tokens
+            # that happen to share the id.
+            generated = _tapped if _tapped[0] == _DEFAULT_TEXT_PAD_ID else _tapped[1:]
     pad_id = _DEFAULT_TEXT_PAD_ID
     reported_pad = _info_get(request_info, "nvc_text_pad_id")
     if reported_pad is not None:
@@ -270,8 +272,18 @@ def talker2code2wav_async_chunk(
         # the prompt-region trim below assumes cumulative payloads. Rebuild
         # the cumulative stack so the trim ships real content rows.
         _cum = _NVC_CUM_CODES.get(request_id)
-        if _cum is not None and codes.shape[0] <= _cum.shape[0]:
+        # A newest-rows payload starts with a code row the stack has not seen;
+        # an already-cumulative payload re-starts from the same first row. The
+        # first-row identity check keeps a cumulative re-delivery of equal row
+        # count from being appended twice.
+        if (
+            _cum is not None
+            and codes.shape[0] <= _cum.shape[0]
+            and not torch.equal(codes[0].cpu(), _cum[0].cpu())
+        ):
             codes = torch.cat([_cum.to(codes.device, dtype=codes.dtype), codes], dim=0)
+        if request_id not in _NVC_CUM_CODES and len(_NVC_CUM_CODES) >= 64:
+            _NVC_CUM_CODES.pop(next(iter(_NVC_CUM_CODES)))
         _NVC_CUM_CODES[request_id] = codes.detach()
 
     # Prompt-region trim (rows are NeMo timeline steps t=1..; keep t >= P).
