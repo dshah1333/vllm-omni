@@ -321,6 +321,12 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             # Sync mode ships the whole timeline up front via
             # nvc_text_timeline; async-chunk mode grows it across chunks and
             # the last chunk sets meta.finished.
+            # Turn state for the silence substitution in _step_session. A PAD
+            # on the text channel means silence only when no turn is open; the
+            # in-turn PAD trail is the TTS still rendering.
+            "agent_idle": True,
+            "in_turn_content": 0,
+            "in_turn_pads": 0,
             "sync_mode": info.get("nvc_text_timeline") is not None,
             "upstream_finished": self._upstream_finished(info) or info.get("nvc_text_timeline") is not None,
         }
@@ -334,6 +340,18 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
             session["timeline"] = latest.to(device)
         if self._upstream_finished(info):
             session["upstream_finished"] = True
+
+    @property
+    def _silence_on_eos(self) -> bool:
+        return bool(getattr(self.config, "tts_cfg", {}).get("inference_force_speech_silence_on_eos", False))
+
+    @property
+    def _silence_on_pad(self) -> bool:
+        return bool(getattr(self.config, "tts_cfg", {}).get("inference_force_speech_silence_on_pad", False))
+
+    @property
+    def _pad_tail_ratio(self) -> float:
+        return float(getattr(self.config, "tts_cfg", {}).get("tts_pad_tail_ratio", 3.0))
 
     def _guidance_enabled(self) -> bool:
         return bool(getattr(self.config, "tts_cfg", {}).get("inference_guidance_enabled", True))
@@ -371,14 +389,52 @@ class NemotronVoiceChatTalkerForConditionalGeneration(nn.Module):
                 generation_config=session["generation_config"],
                 ignore_eos_flag_stop=True,
             )
-        session["code"] = code
+        # The codes just produced are what gets decoded to audio. What is fed
+        # back as prev_audio_tokens is not the same thing: on frames whose text
+        # is EOS, or PAD outside an open turn, the codec has nothing to say and
+        # emits garbled syllables instead of silence. Feeding those back makes
+        # the next step condition on its own hallucination, so the damage
+        # compounds and the whole reply degrades while the text stays perfect.
+        # Substitute silence codes into the feedback only, after the decode
+        # copy is taken.
+        decode_code = code
+        feedback = code
+        subword = current_subword_id.unsqueeze(-1)
+        silence = self.tts.codec_silence_tokens.view(1, 1, -1).expand(code.shape)
+        if self._silence_on_eos:
+            feedback = torch.where(subword == self.tts.text_eos_id, silence, feedback)
+        # An open turn that has emitted far more PAD than content has finished
+        # rendering and is trailing; silence those too.
+        tail_done = (
+            self._pad_tail_ratio > 0
+            and not session["agent_idle"]
+            and session["in_turn_pads"] > self._pad_tail_ratio * max(session["in_turn_content"], 1)
+        )
+        if self._silence_on_pad and (session["agent_idle"] or tail_done):
+            feedback = torch.where(subword == self.tts.text_pad_id, silence, feedback)
+
+        # BOS opens a turn, EOS closes it, PAD leaves it alone. Read after the
+        # TTS step so injected turn-taking tokens are observed too.
+        token_id = int(current_subword_id.reshape(-1)[0].item())
+        if token_id == self.tts.text_bos_id:
+            session["agent_idle"] = False
+            session["in_turn_content"] = 0
+            session["in_turn_pads"] = 0
+        elif token_id == self.tts.text_eos_id:
+            session["agent_idle"] = True
+        elif token_id == self.tts.text_pad_id:
+            session["in_turn_pads"] += 1
+        else:
+            session["in_turn_content"] += 1
+
+        session["code"] = feedback
         session["past_key_values"] = past_key_values
         session["step"] = t + 1
         # Exhausting the currently received timeline ends this scheduler
         # segment. A resumable async-chunk request is then parked with its
         # model-side TTS state intact until the next thinker frame arrives.
         finished = (t + 1) >= int(session["timeline"].numel())
-        return code.reshape(1, -1).to(torch.long), finished
+        return decode_code.reshape(1, -1).to(torch.long), finished
 
     def preprocess(
         self,
