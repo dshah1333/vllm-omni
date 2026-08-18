@@ -430,6 +430,16 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if new_token_ids:
                 num_sampled_tokens = len(new_token_ids)
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                try:
+                    from vllm_omni.model_executor.models.nemotron_voicechat import duplex_text_tap as _nvc_tap
+                    _nvc_tap.record(req_id, int(new_token_ids[-1]))
+                except Exception as exc:  # noqa: BLE001
+                    if not globals().get("_NVC_TAP_WARNED"):
+                        globals()["_NVC_TAP_WARNED"] = True
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "nemotron duplex text tap unavailable (%r); "
+                            "duplex text timelines may come out empty", exc)
                 if new_logprobs is not None and len(new_token_ids) < num_sampled_tokens:
                     # A mid-step stop (e.g. spec-decode tokens sampled past
                     # EOS) trims new_token_ids after the validation slice

@@ -41,6 +41,7 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"codes", "codes.audio", 
 # stt pad_token. The thinker also reports it in its latent metadata, which
 # takes precedence when present.
 _DEFAULT_TEXT_PAD_ID = 12
+_NVC_CUM_CODES: dict = {}
 _STEP_TOKEN_SNAPSHOT_MISSING = object()
 
 
@@ -172,6 +173,18 @@ def thinker2talker_async_chunk(
         # vLLM prompt = logical prompt + 1 placeholder (acoustic frame 0).
         logical_prompt_len = max(len(prompt_ids) - 1, 0)
         generated = generated_now
+    if is_duplex:
+        # Public vLLM 0.27: the step snapshot and output_token_ids are both
+        # unreliable across resumable re-prefill wakes; rebuild the timeline
+        # from engine-accepted tokens. Drop a constant non-pad leading token
+        # (the placeholder-prompt sample accepted before frame decoding).
+        from vllm_omni.model_executor.models.nemotron_voicechat import duplex_text_tap as _tap
+        _tapped = _tap.get(request_id) or _tap.get(str(getattr(request, 'request_id', '')))
+        if _tapped:
+            # Drop only the leading placeholder sample; filtering every
+            # occurrence of its token id would delete legitimate later tokens
+            # that happen to share the id.
+            generated = _tapped if _tapped[0] == _DEFAULT_TEXT_PAD_ID else _tapped[1:]
     pad_id = _DEFAULT_TEXT_PAD_ID
     reported_pad = _info_get(request_info, "nvc_text_pad_id")
     if reported_pad is not None:
@@ -254,6 +267,24 @@ def talker2code2wav_async_chunk(
         )
     if codes.ndim == 1:
         codes = codes.reshape(1, -1)
+    if codec_streaming:
+        # Public vLLM 0.27 delivers only the newest talker code row per wake;
+        # the prompt-region trim below assumes cumulative payloads. Rebuild
+        # the cumulative stack so the trim ships real content rows.
+        _cum = _NVC_CUM_CODES.get(request_id)
+        # A newest-rows payload starts with a code row the stack has not seen;
+        # an already-cumulative payload re-starts from the same first row. The
+        # first-row identity check keeps a cumulative re-delivery of equal row
+        # count from being appended twice.
+        if (
+            _cum is not None
+            and codes.shape[0] <= _cum.shape[0]
+            and not torch.equal(codes[0].cpu(), _cum[0].cpu())
+        ):
+            codes = torch.cat([_cum.to(codes.device, dtype=codes.dtype), codes], dim=0)
+        if request_id not in _NVC_CUM_CODES and len(_NVC_CUM_CODES) >= 64:
+            _NVC_CUM_CODES.pop(next(iter(_NVC_CUM_CODES)))
+        _NVC_CUM_CODES[request_id] = codes.detach()
 
     # Prompt-region trim (rows are NeMo timeline steps t=1..; keep t >= P).
     # Read the prompt length from the PER-STEP model payload first: the
