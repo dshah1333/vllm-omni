@@ -480,6 +480,9 @@ def build_host_weight_cache_plan(
     try:
         records = _collect_runtime_tensors(pipeline, dit_modules)
         content_digest = runtime_content_digest(records)
+        # The cache stores loader-produced ownership: TP coordinates differ,
+        # while equivalent DP replicas and SP ranks may share one entry. The
+        # conservative SP guard prevents reuse across unproven implementations.
         layout_identity = {
             "schema_version": HOST_WEIGHT_CACHE_SCHEMA_VERSION,
             "model": (canonicalize_existing_local_path(model_identity) if model_identity is not None else None),

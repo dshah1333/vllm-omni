@@ -119,6 +119,35 @@ is no-AllGather-only, and it selects the backend transfer protocol. This is
 coordination through typed configuration and `HostWeightPlan`, not through
 model-specific global state.
 
+### Runtime host-layout identity (v1)
+
+Host weight cache v1 identifies the loader-produced host representation, not
+the topology used later to move weights to devices. These are separate
+contracts:
+
+- `RuntimeHostLayout` describes tensor ownership and representation after the
+  ordinary loader has applied its parallel-aware transforms. This is the
+  layout stored in the host weight cache.
+- `DLOTransferLayout` describes whether each worker copies its local weights
+  directly or participates in the existing DLO AllGather protocol. It is not
+  part of the host weight cache in v1; AllGather continues to use its existing
+  process-owned host shards.
+
+The v1 physical-sharing invariant is one cache entry per TP coordinate,
+shared by equivalent DP and SP consumers on the same node. The identity
+therefore includes TP world size and TP rank, because different TP coordinates
+own different tensors. It excludes DP world size/rank and SP rank, because
+those dimensions do not change the final tensor ownership supported by v1.
+SP world size and implementation details remain conservative compatibility
+guards until equivalent layouts across those configurations are proven.
+
+PP, HSDP/DTensor, expert parallelism, and CFG parallelism are rejected rather
+than assigned speculative cache identities. Supporting one of these layouts
+requires first defining its loader-produced ownership, representation, and
+sharing domain; it does not follow automatically from supporting its runtime
+collectives. Consequently, this phase implements a TP-coordinate runtime host
+layout, not a general parallel-layout cache.
+
 ### Shared startup and lifecycle
 
 The shared control path selects host backing and transfers its ownership to

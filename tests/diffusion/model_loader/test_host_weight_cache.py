@@ -162,6 +162,14 @@ def test_expert_parallel_ownership_fails_closed(tmp_path):
     assert list(tmp_path.rglob("*.safetensors")) == []
 
 
+def test_pipeline_parallel_ownership_fails_closed(tmp_path):
+    result = _build(_Pipeline(), tmp_path, pipeline_parallel_size=2)
+
+    assert result.plan is None
+    assert result.fallback_code == "unsupported_pp"
+    assert list(tmp_path.rglob("*.safetensors")) == []
+
+
 def test_corrupt_published_entry_is_rebuilt_under_the_key_lock(tmp_path):
     first = _build(_Pipeline(), tmp_path)
     assert first.plan is not None
