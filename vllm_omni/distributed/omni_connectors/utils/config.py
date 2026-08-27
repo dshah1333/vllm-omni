@@ -17,6 +17,29 @@ TRANSFER_ENGINE_CONNECTOR_NAMES = frozenset(
 )
 
 
+def streaming_stage_context_limit(model_config: Any) -> int:
+    """Effective context limit for a stage that grows a streaming prompt.
+
+    A streaming stage is bounded by its own ``max_model_len`` and, for TTS
+    stages that publish one, the decoder's ``max_position_embeddings``.
+    Returns 0 when no limit can be derived, meaning "unbounded / do not
+    enforce".
+    """
+    limit = int(getattr(model_config, "max_model_len", 0) or 0)
+    hf_config = getattr(model_config, "hf_config", None)
+    tts_config = getattr(hf_config, "tts_config", None)
+    if tts_config is None and getattr(hf_config, "model_type", None) == "minicpmtts":
+        tts_config = hf_config
+    if isinstance(tts_config, dict):
+        tts_limit = tts_config.get("max_position_embeddings", 0)
+    else:
+        tts_limit = getattr(tts_config, "max_position_embeddings", 0)
+    tts_limit = int(tts_limit or 0)
+    if tts_limit > 0:
+        limit = min(limit, tts_limit) if limit > 0 else tts_limit
+    return max(0, limit)
+
+
 def get_stage_connector_role(model_config: Any) -> str | None:
     """Return the configured stage connector direction, if explicit."""
     connector_config = getattr(model_config, "stage_connector_config", None)

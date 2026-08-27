@@ -23,6 +23,7 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.utils import omni_routed_experts_for_request
+from vllm_omni.distributed.omni_connectors.utils.config import streaming_stage_context_limit
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 
@@ -707,6 +708,74 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         return engine_core_outputs
 
+    @property
+    def _streaming_context_limit(self) -> int:
+        """Context ceiling for streaming prompts this stage admits.
+
+        Connector-fed stages get the same ceiling enforced inside the connector
+        receive path; stages the orchestrator feeds directly have no other
+        guard. Resolved once, on first use. 0 means no limit is declared.
+        """
+        limit = self.__dict__.get("_streaming_context_limit_value")
+        if limit is None:
+            limit = streaming_stage_context_limit(getattr(self.vllm_config, "model_config", None))
+            self.__dict__["_streaming_context_limit_value"] = limit
+        return limit
+
+    @staticmethod
+    def _streaming_generation_reserve(update_infos: tuple[Any, ...]) -> int:
+        """Read the producer-declared generation reserve from a streaming update."""
+        for info in update_infos:
+            if not isinstance(info, dict):
+                continue
+            meta = info.get("meta")
+            if not isinstance(meta, dict):
+                continue
+            reserve = meta.get("next_stage_generation_tokens")
+            if isinstance(reserve, int) and not isinstance(reserve, bool) and reserve > 0:
+                return reserve
+        return 0
+
+    def _streaming_capacity_rollover_needed(
+        self,
+        session: Request,
+        update: StreamingUpdate,
+        update_infos: tuple[Any, ...],
+    ) -> bool:
+        """Whether extending this streaming prompt would overrun the stage context.
+
+        The connector receive path enforces the same ceiling for connector-fed
+        stages. A stage the orchestrator feeds directly never runs that path, so
+        without this check its prompt grows past ``max_model_len`` until the
+        engine dies inside ``InputBatch.add_request``. Rolling the prompt over
+        drops stale context instead, which the streaming replacement path
+        already knows how to do.
+
+        Only payloads that declare a positive generation reserve are managed:
+        that reserve is the producer's contract that it needs room to decode
+        after the prompt is admitted.
+        """
+        reserve = self._streaming_generation_reserve(update_infos)
+        if reserve <= 0 or self._streaming_context_limit <= 0:
+            return False
+        incoming = len(update.prompt_token_ids or ())
+        if incoming <= 0:
+            return False
+        if incoming + reserve > self._streaming_context_limit:
+            # A fresh prompt that cannot fit is a configuration error, not a
+            # rollover: replacing would loop. Let it through so the existing
+            # admission error surfaces with its own diagnostics.
+            logger.warning(
+                "Streaming prompt cannot fit the stage context even after rollover: "
+                "req=%s incoming=%d, reserve=%d, limit=%d",
+                session.request_id,
+                incoming,
+                reserve,
+                self._streaming_context_limit,
+            )
+            return False
+        return session.num_computed_tokens + incoming + reserve > self._streaming_context_limit
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
         Override: Only extend prompt at stage 0, and replace
@@ -767,7 +836,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             and info["meta"].get("replace_streaming_prompt") is True
             for info in update_infos
         )
-        if replace_streaming_prompt:
+        capacity_rollover = self._streaming_capacity_rollover_needed(session, update, update_infos)
+        if capacity_rollover:
+            logger.warning(
+                "Rolling over orchestrator-fed streaming prompt before the context limit: "
+                "req=%s computed=%d, incoming=%d, limit=%d",
+                req_id,
+                session.num_computed_tokens,
+                len(update.prompt_token_ids or ()),
+                self._streaming_context_limit,
+            )
+        if replace_streaming_prompt or capacity_rollover:
             self._release_replaced_streaming_prompt_cache(session)
             self._replace_streaming_session(session, update)
             return
