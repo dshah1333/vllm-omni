@@ -669,6 +669,22 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
+def get_deploy_duplex_max_sessions(rel_path: str, default: int = 1) -> int:
+    """Return ``duplex_session.max_sessions`` from a deploy yaml.
+
+    ``default`` mirrors ``DuplexSessionConfig.max_sessions`` so a deploy config
+    that declares no capacity resolves to the limit the server itself applies.
+    """
+    with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    duplex_session = cfg.get("duplex_session")
+    max_sessions = duplex_session.get("max_sessions") if isinstance(duplex_session, dict) else None
+    if isinstance(max_sessions, int) and not isinstance(max_sessions, bool) and max_sessions > 0:
+        return max_sessions
+    return default
+
+
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
     """Return ``stage_id`` values from a new-schema deploy YAML (``stages``)."""
     with open(stage_config_path, encoding="utf-8") as f:
