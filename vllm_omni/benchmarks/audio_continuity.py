@@ -17,6 +17,7 @@ A deficit > ``threshold_s`` at any point counts as an audible underrun.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -88,4 +89,34 @@ def compute_continuity_stats(
         max_underrun_s=max_underrun_s,
         underrun_event_count=event_count,
         is_continuous=max_underrun_s <= threshold_s,
+    )
+
+
+def roll_up_continuity_stats(per_response: Iterable[ContinuityStats]) -> ContinuityStats | None:
+    """Combine per-response stats into one verdict for a multi-response session.
+
+    Callers score each response on its own arrival timeline first. Running the
+    simulated player across a concatenated session instead would read the
+    silence between turns -- the model waiting on the next user utterance -- as
+    player starvation.
+
+    The roll-up is worst-case, never a mean: nine clean responses and one
+    audible 3 s gap must not average down to a passing 0.3 s.
+
+    Args:
+        per_response: Stats for the responses that actually carried audio.
+            Responses with no audio are the caller's to exclude -- scoring them
+            as a clean 0.0 s would inflate the result.
+
+    Returns:
+        The combined stats, or ``None`` when there is nothing to roll up, so
+        callers report "not measured" rather than a default-clean score.
+    """
+    stats = list(per_response)
+    if not stats:
+        return None
+    return ContinuityStats(
+        max_underrun_s=max(item.max_underrun_s for item in stats),
+        underrun_event_count=sum(item.underrun_event_count for item in stats),
+        is_continuous=all(item.is_continuous for item in stats),
     )

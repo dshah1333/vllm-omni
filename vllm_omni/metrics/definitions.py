@@ -35,6 +35,10 @@ AUDIO_RTF = "audio_rtf"
 AUDIO_FRAMES = "audio_frames"
 AUDIO_UNDERRUN = "audio_underrun"
 AUDIO_CONTINUITY_OK = "audio_continuity_ok"
+#: Whether the backend actually ran continuity analysis for this request.
+#: ``AUDIO_UNDERRUN``/``AUDIO_CONTINUITY_OK`` carry benign defaults, so without
+#: this flag a backend that never measures continuity reports a perfect score.
+AUDIO_CONTINUITY_MEASURED = "audio_continuity_measured"
 AUDIO_SKIPPED_REQUESTS = "audio_skipped_requests"
 
 # Bench-side aggregate field names. Keep these centralized so new benchmark
@@ -59,6 +63,9 @@ MEDIAN_AUDIO_UNDERRUN_S = f"median_{AUDIO_UNDERRUN}_s"
 STD_AUDIO_UNDERRUN_S = f"std_{AUDIO_UNDERRUN}_s"
 PERCENTILES_AUDIO_UNDERRUN_S = f"percentiles_{AUDIO_UNDERRUN}_s"
 AUDIO_CONTINUITY_OK_RATE = f"{AUDIO_CONTINUITY_OK}_rate"
+#: How many completed requests contributed to the continuity aggregates.
+#: Zero means the rate and underrun percentiles say nothing.
+AUDIO_CONTINUITY_MEASURED_REQUESTS = f"{AUDIO_CONTINUITY_MEASURED}_requests"
 
 IMAGE_COUNT = "image_count"
 IMAGE_GENERATION = "image_generation"

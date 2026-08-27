@@ -251,6 +251,101 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.last_received_at("response.audio.delta") is not None
 
 
+def test_audio_chunk_timeline_pairs_each_chunk_with_its_arrival():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=1.0)
+    for index, payload in enumerate((b"aa", b"bbbb", b"cccccc")):
+        collector.add(
+            {
+                "type": "response.audio.delta",
+                "response_id": "resp-a",
+                "delta": base64.b64encode(payload).decode("ascii"),
+            },
+            received_at_s=1.1 + index * 0.1,
+        )
+
+    arrival_times_s, chunk_bytes = collector.audio_chunk_timeline("resp-a")
+
+    assert arrival_times_s == pytest.approx([1.1, 1.2, 1.3])
+    assert chunk_bytes == [2, 4, 6]
+
+
+def test_audio_chunk_timeline_stays_aligned_when_a_delta_fails_to_decode():
+    # The undecodable delta still lands in ``events`` (and so does its
+    # timestamp), so zipping ``events`` against ``response_audio`` would pair
+    # every later chunk with the arrival time of the one before it.
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=5.0)
+    collector.add(
+        {
+            "type": "response.audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(b"good-one").decode("ascii"),
+        },
+        received_at_s=5.5,
+    )
+    collector.add(
+        {"type": "response.audio.delta", "response_id": "resp-a", "delta": "!!! not base64 !!!"},
+        received_at_s=5.6,
+    )
+    collector.add(
+        {
+            "type": "response.audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(b"good-two").decode("ascii"),
+        },
+        received_at_s=5.9,
+    )
+
+    arrival_times_s, chunk_bytes = collector.audio_chunk_timeline("resp-a")
+
+    assert collector.count("response.audio.delta") == 3
+    assert chunk_bytes == [8, 8]
+    # 5.9, not the 5.6 the dropped delta arrived at.
+    assert arrival_times_s == pytest.approx([5.5, 5.9])
+
+
+def test_audio_chunk_timeline_drops_empty_chunks():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=0.0)
+    collector.add(
+        {"type": "response.audio.delta", "response_id": "resp-a", "delta": ""},
+        received_at_s=0.1,
+    )
+    collector.add(
+        {
+            "type": "response.audio.delta",
+            "response_id": "resp-a",
+            "delta": base64.b64encode(b"real").decode("ascii"),
+        },
+        received_at_s=0.4,
+    )
+
+    arrival_times_s, chunk_bytes = collector.audio_chunk_timeline("resp-a")
+
+    # A zero-byte arrival carries no playable audio, so it must not become the
+    # playback origin and invent 0.3 s of starvation.
+    assert chunk_bytes == [4]
+    assert arrival_times_s == pytest.approx([0.4])
+
+
+def test_audio_chunk_timeline_is_empty_when_arrival_times_were_never_recorded():
+    # A hand-built collector carries audio with no timestamps. Reporting an
+    # empty timeline lets the caller say "not measured"; raising would fail
+    # the whole benchmark request over a metric.
+    collector = RealtimeEventCollector(response_audio={"resp-a": [b"audio"]})
+
+    assert collector.audio_chunk_timeline("resp-a") == ([], [])
+
+
+def test_audio_chunk_timeline_is_empty_for_a_silent_response():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}}, received_at_s=0.0)
+
+    assert collector.audio_chunk_timeline("resp-a") == ([], [])
+    assert collector.audio_chunk_timeline("resp-missing") == ([], [])
+
+
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     collector = RealtimeEventCollector()
     collector.add(

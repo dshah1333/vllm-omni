@@ -16,6 +16,7 @@ import pytest
 from vllm_omni.benchmarks.audio_continuity import (
     ContinuityStats,
     compute_continuity_stats,
+    roll_up_continuity_stats,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -121,3 +122,33 @@ def test_threshold_is_configurable() -> None:
     assert strict.is_continuous is False
     assert lenient.is_continuous is True
     assert strict.max_underrun_s == lenient.max_underrun_s
+
+
+def test_roll_up_is_empty_when_no_response_carried_audio() -> None:
+    assert roll_up_continuity_stats([]) is None
+
+
+def test_roll_up_takes_the_worst_response_not_the_average() -> None:
+    clean = ContinuityStats(max_underrun_s=0.0, underrun_event_count=0, is_continuous=True)
+    stalled = ContinuityStats(max_underrun_s=3.0, underrun_event_count=2, is_continuous=False)
+
+    rolled = roll_up_continuity_stats([clean] * 9 + [stalled])
+
+    # A mean would report 0.3 s and pass the 100 ms budget while the listener
+    # heard a 3 s hole.
+    assert rolled == ContinuityStats(
+        max_underrun_s=3.0,
+        underrun_event_count=2,
+        is_continuous=False,
+    )
+
+
+def test_roll_up_sums_events_across_responses() -> None:
+    first = ContinuityStats(max_underrun_s=0.2, underrun_event_count=3, is_continuous=False)
+    second = ContinuityStats(max_underrun_s=0.5, underrun_event_count=4, is_continuous=False)
+
+    rolled = roll_up_continuity_stats([first, second])
+
+    assert rolled is not None
+    assert rolled.max_underrun_s == pytest.approx(0.5)
+    assert rolled.underrun_event_count == 7

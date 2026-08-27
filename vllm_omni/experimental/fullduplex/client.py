@@ -195,6 +195,10 @@ class RealtimeEventCollector:
     events: list[dict[str, object]] = field(default_factory=list)
     event_received_at_s: list[float] = field(default_factory=list)
     response_audio: dict[str, list[bytes]] = field(default_factory=dict)
+    #: Client receive time (monotonic seconds) of each decoded chunk in
+    #: ``response_audio``. Written in the same step as the audio itself so the
+    #: two stay index-aligned even when a delta fails to decode.
+    response_audio_received_at_s: dict[str, list[float]] = field(default_factory=dict)
     response_ids: list[str] = field(default_factory=list)
     output_sample_rate_hz: int = 24_000
 
@@ -224,9 +228,12 @@ class RealtimeEventCollector:
             delta = stored_event.get("delta") or stored_event.get("audio")
             if isinstance(delta, str) and response_id:
                 try:
-                    self.response_audio.setdefault(response_id, []).append(base64.b64decode(delta))
+                    decoded = base64.b64decode(delta)
                 except ValueError:
                     pass
+                else:
+                    self.response_audio.setdefault(response_id, []).append(decoded)
+                    self.response_audio_received_at_s.setdefault(response_id, []).append(received_at)
             sample_rate_hz = stored_event.get("sample_rate_hz")
             if isinstance(sample_rate_hz, int) and sample_rate_hz > 0:
                 self.output_sample_rate_hz = sample_rate_hz
@@ -240,6 +247,32 @@ class RealtimeEventCollector:
         return b"".join(
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
         )
+
+    def audio_chunk_timeline(self, response_id: str) -> tuple[list[float], list[int]]:
+        """Return the aligned arrival times and sizes of one response's audio.
+
+        Both lists are appended together in :meth:`add`, so they stay
+        index-aligned even when a delta fails to decode -- zipping the raw
+        ``events`` timestamps against ``response_audio`` would not, because a
+        dropped chunk leaves its event (and its timestamp) behind. Empty chunks
+        are excluded: they carry no playable audio but would move the playback
+        origin if one arrived first.
+
+        Returns:
+            ``(arrival_times_s, chunk_bytes)`` in receive order, shaped for
+            :func:`vllm_omni.benchmarks.audio_continuity.compute_continuity_stats`.
+        """
+        chunks = self.response_audio.get(response_id, ())
+        arrivals = self.response_audio_received_at_s.get(response_id, ())
+        if len(chunks) != len(arrivals):
+            # Only reachable for a collector populated by hand rather than
+            # through ``add`` (fixtures, tests). There is no timeline to
+            # report, and reconstructing one from the event stream is the
+            # misalignment this method exists to avoid, so report nothing and
+            # let the caller treat the response as unmeasured.
+            return [], []
+        timeline = [(received_at_s, len(chunk)) for chunk, received_at_s in zip(chunks, arrivals) if chunk]
+        return [received_at_s for received_at_s, _ in timeline], [size for _, size in timeline]
 
     def response_text(self, response_id: str) -> str:
         """Join all text/transcript deltas for one response identity."""
