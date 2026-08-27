@@ -776,3 +776,38 @@ def test_whole_benchmark_lock_serializes_a_shared_output_root(tmp_path: Path, mo
         release.set()
         assert first.result() == second.result() == {"total": 1}
     assert calls == [0, 1]
+
+
+def test_populate_response_metrics_passes_audio_cadence_through():
+    collector = RealtimeEventCollector()
+    delta = base64.b64encode(b"\x01\x00").decode("ascii")
+    collector.add({"type": "response.created", "response": {"id": "resp-gap"}}, received_at_s=10.0)
+    collector.add({"type": "response.audio.delta", "response_id": "resp-gap", "delta": delta}, received_at_s=10.1)
+    collector.add({"type": "response.audio.delta", "response_id": "resp-gap", "delta": delta}, received_at_s=10.9)
+    result = oi.OmniInteractCaseResult("1q1a", "video.mp4", "out", session_id="session-gap")
+
+    oi._populate_response_metrics(result, collector, stream_start=0.0)
+
+    assert len(result.duplex_request_metrics) == 1
+    audio_output = result.duplex_request_metrics[0]["audio_output"]
+    assert audio_output["max_chunk_gap_ms"] == 800.0
+    assert audio_output["chunk_count"] == 2
+    assert result.duplex_session_metrics["max_chunk_gap_ms"] == 800.0
+
+
+def test_benchmark_summary_reports_worst_chunk_gap():
+    def case_result(session_metrics: dict[str, object]) -> oi.OmniInteractCaseResult:
+        return oi.OmniInteractCaseResult(
+            "1q1a", "video.mp4", "out", success=True, duplex_session_metrics=session_metrics
+        )
+
+    summary = oi.benchmark_summary(
+        [
+            case_result({"max_chunk_gap_ms": 120.0}),
+            case_result({"max_chunk_gap_ms": 450.0}),
+            case_result({}),
+        ]
+    )
+
+    assert summary["max_chunk_gap_ms"] == 450.0
+    assert oi.benchmark_summary([case_result({})])["max_chunk_gap_ms"] is None

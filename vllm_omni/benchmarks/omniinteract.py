@@ -111,6 +111,11 @@ class _DeferredArtifactContext:
 def benchmark_summary(results: list[OmniInteractCaseResult]) -> dict[str, Any]:
     succeeded = sum(result.success for result in results)
     eligible = sum(result.success and result.eligible_for_official_eval for result in results)
+    max_chunk_gaps_ms = [
+        gap
+        for result in results
+        if isinstance(gap := result.duplex_session_metrics.get("max_chunk_gap_ms"), int | float)
+    ]
     return {
         "total": len(results),
         "success": succeeded,
@@ -118,6 +123,7 @@ def benchmark_summary(results: list[OmniInteractCaseResult]) -> dict[str, Any]:
         "eligible_for_official_eval": eligible,
         "successful_but_ineligible": succeeded - eligible,
         "audio_clipped_bytes": sum(result.audio_clipped_bytes for result in results),
+        "max_chunk_gap_ms": max(max_chunk_gaps_ms) if max_chunk_gaps_ms else None,
         "results": [result.as_dict() for result in results],
     }
 
@@ -801,6 +807,7 @@ def _populate_response_metrics(
         )
         raw_metric = timing.get("request_metrics")
         stage0 = timing.get("stage0_tokens")
+        audio_output = timing.get("audio_output")
         metric = {
             "session_id": result.session_id,
             "request_index": request_index,
@@ -810,7 +817,9 @@ def _populate_response_metrics(
         if isinstance(stage0, dict):
             metric["stage0_tokens"] = dict(stage0)
             output_tokens += int(stage0.get("output_token_count") or 0)
-        if isinstance(raw_metric, dict) or isinstance(stage0, dict):
+        if isinstance(audio_output, dict):
+            metric["audio_output"] = dict(audio_output)
+        if isinstance(raw_metric, dict) or isinstance(stage0, dict) or isinstance(audio_output, dict):
             request_metrics.append(metric)
     result.output_tokens = output_tokens
     result.duplex_request_metrics = request_metrics

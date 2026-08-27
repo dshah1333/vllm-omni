@@ -69,12 +69,22 @@ def summarize_session_request_metrics(
         values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
         return round(sum(values) / len(values), digits) if values else None
 
+    def turn_max_chunk_gap_ms(request: dict[str, object]) -> float | None:
+        audio_output = request.get("audio_output")
+        if not isinstance(audio_output, dict):
+            return None
+        return _finite_number(audio_output.get("max_chunk_gap_ms"), nonnegative=True)
+
+    # The worst intra-turn audio gap is the session's stall headline: a context
+    # rollover or scheduler stall shows up here before any mean moves.
+    max_chunk_gaps_ms = [gap for request in request_metrics if (gap := turn_max_chunk_gap_ms(request)) is not None]
     return {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
         "mean_ttft_ms": mean("ttft_ms"),
         "mean_ttfp_ms": mean("ttfp_ms"),
         "mean_rtf": mean("rtf", digits=6),
+        "max_chunk_gap_ms": max(max_chunk_gaps_ms) if max_chunk_gaps_ms else None,
     }
 
 

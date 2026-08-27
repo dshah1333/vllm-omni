@@ -13,6 +13,7 @@ from vllm_omni.experimental.fullduplex.client import (
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
+    summarize_session_request_metrics,
     write_pcm16_wav,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
@@ -418,3 +419,23 @@ def test_realtime_client_pcm16_wav_round_trip(tmp_path):
         assert wav_file.getnchannels() == 1
         assert wav_file.getframerate() == 16_000
     assert read_pcm16_wav(path) == pcm16
+
+
+def test_summarize_session_request_metrics_reports_worst_chunk_gap():
+    summary = summarize_session_request_metrics(
+        [
+            {"ttft_ms": 10.0, "audio_output": {"max_chunk_gap_ms": 90.0}},
+            {"ttft_ms": 20.0, "audio_output": {"max_chunk_gap_ms": 410.0}},
+            {"ttft_ms": 30.0},
+        ],
+        session_id="session-gaps",
+    )
+
+    assert summary["max_chunk_gap_ms"] == 410.0
+    assert summary["mean_ttft_ms"] == 20.0
+
+
+def test_summarize_session_request_metrics_omits_gap_without_audio_cadence():
+    summary = summarize_session_request_metrics([{"ttft_ms": 1.0}], session_id="session-no-audio")
+
+    assert summary["max_chunk_gap_ms"] is None

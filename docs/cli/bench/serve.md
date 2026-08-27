@@ -307,6 +307,20 @@ omitted from the official manifest; `audio_clipped_bytes` records output beyond 
 TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
 every token interval is present.
 
+#### Measuring context-rollover stall
+
+Long native-duplex sessions roll the Talker prompt over when `computed + incoming + reserve` would exceed the connector
+context limit (the smaller of the stage `max_model_len` and the TTS `max_position_embeddings`). Each per-response entry in
+`duplex_request_metrics` carries the client-observed `audio_output` cadence (`inter_chunk_interval_ms`, `max_chunk_gap_ms`),
+`duplex_session_metrics` reports the worst gap in the session, and `batch_summary.json` reports the worst gap in the run —
+a rollover stall surfaces there before any mean moves.
+
+To trigger rollover deterministically instead of waiting for a long session to fill the default context, serve the Talker
+stage with a reduced `max_model_len` and rerun the same cases; with greedy decoding the rollover fires at the same point
+every run. The server logs each rollover as `Rolling over streaming prompt and dropping its KV state before the context
+limit: computed=…, next=…, reserve=…, limit=…`, so client-side gaps can be correlated with rollover events by timestamp.
+Compare `max_chunk_gap_ms` against a baseline leg served with the default limit to isolate the rollover cost.
+
 ### Multi-Modal Benchmark
 
 <details class="admonition abstract" markdown="1">
