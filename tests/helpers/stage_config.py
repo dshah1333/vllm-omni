@@ -674,15 +674,20 @@ def get_deploy_duplex_max_sessions(rel_path: str, default: int = 1) -> int:
 
     ``default`` mirrors ``DuplexSessionConfig.max_sessions`` so a deploy config
     that declares no capacity resolves to the limit the server itself applies.
+    A declared but invalid capacity raises instead of silently falling back to a
+    limit the server would never use, matching the runtime validation.
     """
     with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
     duplex_session = cfg.get("duplex_session")
-    max_sessions = duplex_session.get("max_sessions") if isinstance(duplex_session, dict) else None
-    if isinstance(max_sessions, int) and not isinstance(max_sessions, bool) and max_sessions > 0:
-        return max_sessions
-    return default
+    if not isinstance(duplex_session, dict) or "max_sessions" not in duplex_session:
+        return default
+
+    max_sessions = duplex_session["max_sessions"]
+    if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions <= 0:
+        raise ValueError(f"duplex_session.max_sessions must be a positive int in {rel_path!r}, got {max_sessions!r}")
+    return max_sessions
 
 
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
@@ -750,6 +755,7 @@ def stage_config_path_for_run_level(stage_config_path: str | None, run_level: st
 __all__ = [
     "get_deploy_config_path",
     "get_deploy_config_stage",
+    "get_deploy_duplex_max_sessions",
     "get_stage_entries",
     "load_stage_ids",
     "load_stage_replica_counts",
