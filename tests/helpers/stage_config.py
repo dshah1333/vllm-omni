@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from vllm_omni.config.stage_config import load_deploy_config
+
 
 def modify_stage_config(
     yaml_path: str,
@@ -669,25 +671,14 @@ def get_deploy_config_stage(rel_path: str, stage_id: int) -> dict[str, Any]:
     raise KeyError(f"No stage_id={stage_id} in deploy config {rel_path!r}")
 
 
-def get_deploy_duplex_max_sessions(rel_path: str, default: int = 1) -> int:
-    """Return ``duplex_session.max_sessions`` from a deploy yaml.
+def get_deploy_duplex_max_sessions(rel_path: str) -> int:
+    """Return the duplex session capacity a deploy yaml admits.
 
-    ``default`` mirrors ``DuplexSessionConfig.max_sessions`` so a deploy config
-    that declares no capacity resolves to the limit the server itself applies.
-    A declared but invalid capacity raises instead of silently falling back to a
-    limit the server would never use, matching the runtime validation.
+    Loads through ``load_deploy_config`` so ``base_config`` merging and
+    ``DuplexSessionRuntimeConfig`` defaults stay in lockstep with the server
+    instead of being re-implemented here.
     """
-    with open(get_deploy_config_path(rel_path), encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-
-    duplex_session = cfg.get("duplex_session")
-    if not isinstance(duplex_session, dict) or "max_sessions" not in duplex_session:
-        return default
-
-    max_sessions = duplex_session["max_sessions"]
-    if not isinstance(max_sessions, int) or isinstance(max_sessions, bool) or max_sessions <= 0:
-        raise ValueError(f"duplex_session.max_sessions must be a positive int in {rel_path!r}, got {max_sessions!r}")
-    return max_sessions
+    return load_deploy_config(get_deploy_config_path(rel_path)).duplex_session.max_sessions
 
 
 def _stage_ids_from_deploy_yaml(stage_config_path: str) -> list[int]:
