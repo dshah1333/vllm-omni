@@ -28,7 +28,8 @@ class ContinuityStats:
     Attributes:
         max_underrun_s: Worst-case wall-clock seconds the player was starved.
         underrun_event_count: Inter-chunk intervals during which the buffer
-            went negative (one per gap, not per starved millisecond).
+            went short by at least one sample frame (one per gap, not per
+            starved millisecond).
         is_continuous: ``max_underrun_s <= threshold_s`` for the request.
     """
 
@@ -70,6 +71,15 @@ def compute_continuity_stats(
     if bytes_per_s <= 0:
         return ContinuityStats(0.0, 0, True)
 
+    # Smallest shortfall a listener could hear: one missing sample frame.
+    # Below that the arithmetic is dominated by float rounding -- differencing
+    # two wall-clock arrival times can leave a sub-nanosecond positive residue
+    # on a stream that was fed exactly on time, and a bare ``> 0`` test counts
+    # that as a gap. The deficits it invents are ~1e-15 s, invisible in
+    # ``max_underrun_s`` but not in the event tally: a clean ten-turn session
+    # was reporting six underrun events that never happened.
+    min_deficit_bytes = max(sample_width * channels, 1)
+
     t0 = chunk_arrival_times_s[0]
     received_before = 0
     max_underrun_s = 0.0
@@ -78,7 +88,7 @@ def compute_continuity_stats(
         if i > 0:
             played_bytes = (chunk_arrival_times_s[i] - t0) * bytes_per_s
             deficit_bytes = played_bytes - received_before
-            if deficit_bytes > 0:
+            if deficit_bytes >= min_deficit_bytes:
                 deficit_s = deficit_bytes / bytes_per_s
                 if deficit_s > max_underrun_s:
                     max_underrun_s = deficit_s

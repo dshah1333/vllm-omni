@@ -124,6 +124,48 @@ def test_threshold_is_configurable() -> None:
     assert strict.max_underrun_s == lenient.max_underrun_s
 
 
+def test_exactly_on_time_arrivals_report_no_underrun_events() -> None:
+    """Float rounding must not invent gaps on a stream fed exactly on time.
+
+    ``(t[i] - t[0]) * bytes_per_s`` can land a fraction of a byte above the
+    bytes received on a stream that arrived perfectly on schedule. A bare
+    ``> 0`` deficit test counted each of those as an underrun event.
+    """
+    # 100 ms of audio arriving every 100 ms, starting at a large wall-clock
+    # offset so the subtraction carries realistic rounding error.
+    arrivals = [123_456.0 + index * 0.1 for index in range(20)]
+    stats = compute_continuity_stats(
+        chunk_arrival_times_s=arrivals,
+        chunk_bytes=[_BPS // 10] * 20,
+        sample_rate=_SR,
+        threshold_s=0.1,
+    )
+
+    assert stats.underrun_event_count == 0
+    assert stats.max_underrun_s == 0.0
+    assert stats.is_continuous is True
+
+
+def test_a_sub_millisecond_gap_still_counts() -> None:
+    """The one-frame floor must not swallow a genuinely short shortfall.
+
+    Measured at a large wall-clock offset, as the Realtime path supplies: an
+    exactly-one-frame deficit sits on the rounding boundary there, so the floor
+    is a floor and not a promise about the last frame.
+    """
+    gap_s = 10.0 / _SR  # ~417 us, still far under the 100 ms budget
+    stats = compute_continuity_stats(
+        chunk_arrival_times_s=[123_456.0, 123_456.1 + gap_s],
+        chunk_bytes=[_BPS // 10, _BPS // 10],
+        sample_rate=_SR,
+        threshold_s=0.1,
+    )
+
+    assert stats.underrun_event_count == 1
+    assert stats.max_underrun_s == pytest.approx(gap_s, abs=1e-6)
+    assert stats.is_continuous is True
+
+
 def test_roll_up_is_empty_when_no_response_carried_audio() -> None:
     assert roll_up_continuity_stats([]) is None
 
