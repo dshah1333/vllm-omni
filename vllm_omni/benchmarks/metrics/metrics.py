@@ -44,6 +44,7 @@ _MULTIMODAL_BENCHMARK_FIELDS = [
     (defs.STD_AUDIO_UNDERRUN_S, float, field(default=0.0)),
     (defs.PERCENTILES_AUDIO_UNDERRUN_S, _PERCENTILE_ROWS_TYPE, field(default=None)),
     (defs.AUDIO_CONTINUITY_OK_RATE, float, field(default=1.0)),
+    (defs.AUDIO_CONTINUITY_MEASURED_REQUESTS, int, field(default=0)),
     (defs.TOTAL_IMAGES, int, field(default=0)),
     (defs.IMAGE_THROUGHPUT, float, field(default=0.0)),
     (defs.AVERAGE_PIXELS_PER_IMAGE, float, field(default=0.0)),
@@ -192,6 +193,9 @@ def has_metric_samples(metrics: object, metric_name: str) -> bool:
         "itl": "num_itl_samples",
         defs.AUDIO_TTFP: "num_audio_ttfp_samples",
         defs.AUDIO_RTF: "num_audio_rtf_samples",
+        # Underrun percentiles are meaningless when no backend timed a chunk;
+        # without this the aggregate defaults publish a clean 0.00 s.
+        defs.AUDIO_UNDERRUN: defs.AUDIO_CONTINUITY_MEASURED_REQUESTS,
     }.get(metric_name)
     return sample_count_attr is None or getattr(metrics, sample_count_attr, 0) > 0
 
@@ -282,12 +286,16 @@ def print_audio_metrics(selected_percentile_metrics, metrics: MultiModalsBenchma
     )
     print("{:<40} {:<10}".format("Total audio frames generated:", getattr(metrics, defs.TOTAL_AUDIO_FRAMES)))
     print("{:<40} {:<10.2f}".format("Audio throughput(audio duration/s):", getattr(metrics, defs.AUDIO_THROUGHPUT)))
-    print(
-        "{:<40} {:<10.2%}".format(
-            "Streaming continuity OK rate:",
-            getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE),
-        )
-    )
+    continuity_measured = int(getattr(metrics, defs.AUDIO_CONTINUITY_MEASURED_REQUESTS, 0) or 0)
+    if continuity_measured:
+        # Carry the sample count: a measured 100% and an unmeasured default
+        # 100% are otherwise the same line.
+        rate = getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE)
+        print("{:<40} {:<10}".format("Streaming continuity OK rate:", f"{rate:.2%} ({continuity_measured} measured)"))
+    else:
+        # Reporting the default 100% here would claim a clean result for a
+        # backend that never timed a single audio chunk.
+        print("{:<40} {:<10}".format("Streaming continuity OK rate:", "not measured"))
     for metric in selected_percentile_metrics:
         if metric.startswith("audio"):
             process_one_metric(metric, metrics)
@@ -819,8 +827,13 @@ def calculate_metrics(
             denoise_step_latency_ms = float(getattr(outputs[i], defs.DENOISE_STEP_LATENCY_MS, 0.0) or 0.0)
             if denoise_step_latency_ms > 0:
                 denoise_step_latencies_ms.append(denoise_step_latency_ms)
-            audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
-            audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
+            # Only backends that ran continuity analysis may vote. The two
+            # fields default to a clean result, so counting every completed
+            # request would report a perfect continuity rate for benchmarks
+            # that never looked at audio arrival timing at all.
+            if bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_MEASURED, False)):
+                audio_underruns.append(getattr(outputs[i], f"{defs.AUDIO_UNDERRUN}_s", 0.0))
+                audio_continuity_ok.append(bool(getattr(outputs[i], defs.AUDIO_CONTINUITY_OK, True)))
             e2els.append(outputs[i].latency)
             input_audio_duration += outputs[i].input_audio_duration
             completed += 1
@@ -1010,6 +1023,7 @@ def calculate_metrics(
             defs.AUDIO_CONTINUITY_OK_RATE: (
                 (sum(audio_continuity_ok) / len(audio_continuity_ok)) if audio_continuity_ok else 1.0
             ),
+            defs.AUDIO_CONTINUITY_MEASURED_REQUESTS: len(audio_continuity_ok),
         },
     )
     print_metrics(

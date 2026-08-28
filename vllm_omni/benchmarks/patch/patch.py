@@ -14,7 +14,7 @@ import time
 import traceback
 import uuid
 import wave
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +41,11 @@ from vllm.benchmarks.lib.endpoint_request_func import (
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
-from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
+from vllm_omni.benchmarks.audio_continuity import (
+    ContinuityStats,
+    compute_continuity_stats,
+    roll_up_continuity_stats,
+)
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
     DailyOmniDataset,
     DailyOmniSampleRequest,
@@ -85,6 +89,7 @@ from vllm_omni.benchmarks.omniinteract import (
 )
 from vllm_omni.experimental.fullduplex.client import (
     RealtimeDuplexClient,
+    RealtimeEventCollector,
     build_realtime_url,
     reference_audio_data_url,
     summarize_session_request_metrics,
@@ -658,6 +663,11 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Number of inter-chunk intervals during which the player buffer went
     #: negative.
     audio_underrun_event_count: int = 0
+    #: Whether this backend ran continuity analysis at all. The three fields
+    #: above default to a clean result, so without this flag a backend that
+    #: never measures continuity is indistinguishable from one that measured a
+    #: perfect stream, and the aggregate silently reports 100%.
+    audio_continuity_measured: bool = False
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
@@ -1441,17 +1451,22 @@ async def async_request_openai_audio_speech(
                 if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
-                continuity = compute_continuity_stats(
-                    chunk_arrival_times_s=chunk_arrival_times_s,
-                    chunk_bytes=chunk_sizes,
-                    sample_rate=sample_rate,
-                    sample_width=sample_width,
-                    channels=channels,
-                    threshold_s=_audio_continuity_threshold_s(),
-                )
-                output.audio_underrun_s = continuity.max_underrun_s
-                output.audio_continuity_ok = continuity.is_continuous
-                output.audio_underrun_event_count = continuity.underrun_event_count
+                if chunk_sizes:
+                    # A 200 with no PCM body is a real outcome here (the server
+                    # logs status=ok first_chunk_ms=NA). Scoring that empty
+                    # response clean would let it vote in the continuity rate.
+                    continuity = compute_continuity_stats(
+                        chunk_arrival_times_s=chunk_arrival_times_s,
+                        chunk_bytes=chunk_sizes,
+                        sample_rate=sample_rate,
+                        sample_width=sample_width,
+                        channels=channels,
+                        threshold_s=_audio_continuity_threshold_s(),
+                    )
+                    output.audio_underrun_s = continuity.max_underrun_s
+                    output.audio_continuity_ok = continuity.is_continuous
+                    output.audio_underrun_event_count = continuity.underrun_event_count
+                    output.audio_continuity_measured = True
                 if pcm_capture is not None and pcm_capture:
                     try:
                         output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
@@ -1596,6 +1611,47 @@ async def _async_request_omniinteract(
     return output
 
 
+def _session_audio_continuity(
+    events: RealtimeEventCollector,
+    response_ids: Sequence[str],
+    *,
+    sample_rate: int,
+    threshold_s: float,
+) -> ContinuityStats | None:
+    """Roll per-response continuity up into one verdict for a duplex session.
+
+    Scores each response on its own arrival timeline, then hands the results to
+    :func:`~vllm_omni.benchmarks.audio_continuity.roll_up_continuity_stats`.
+
+    Args:
+        events: Collector holding the session's decoded audio deltas.
+        response_ids: Responses to score, in turn order.
+        sample_rate: Output PCM sample rate (Hz).
+        threshold_s: Per-response underrun budget.
+
+    Returns:
+        The rolled-up stats, or ``None`` when no response carried audio, so
+        callers report "not measured" rather than a default-clean score.
+    """
+    measured: list[ContinuityStats] = []
+    for response_id in response_ids:
+        arrival_times_s, chunk_bytes = events.audio_chunk_timeline(response_id)
+        if not chunk_bytes:
+            # Listen-only or cancelled turn: no stream to starve.
+            continue
+        measured.append(
+            compute_continuity_stats(
+                chunk_arrival_times_s=arrival_times_s,
+                chunk_bytes=chunk_bytes,
+                sample_rate=sample_rate,
+                sample_width=defs.DEFAULT_AUDIO_SAMPLE_WIDTH,
+                channels=1,
+                threshold_s=threshold_s,
+            )
+        )
+    return roll_up_continuity_stats(measured)
+
+
 async def async_request_openai_realtime_duplex(
     request_func_input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -1642,6 +1698,7 @@ async def async_request_openai_realtime_duplex(
             turn_timings: list[dict[str, object]] = []
             turn_pcm_bytes: list[bytes] = []
             turn_transcripts: list[str] = []
+            audio_response_ids: list[str] = []
             measurement_origin = {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
                 "ttfp": "conversation.item.create client send to first audio packet",
@@ -1685,6 +1742,7 @@ async def async_request_openai_realtime_duplex(
                         f"got {len(new_audio_response_ids)}"
                     )
                 response_id = new_audio_response_ids[0]
+                audio_response_ids.append(response_id)
                 timing = client.events.timing_summary(
                     after_s=turn_started_at_s,
                     input_committed_at_s=turn_started_at_s,
@@ -1729,6 +1787,17 @@ async def async_request_openai_realtime_duplex(
                 sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
             )
             output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
+            continuity = _session_audio_continuity(
+                client.events,
+                audio_response_ids,
+                sample_rate=client.events.output_sample_rate_hz,
+                threshold_s=_audio_continuity_threshold_s(),
+            )
+            if continuity is not None:
+                output.audio_underrun_s = continuity.max_underrun_s
+                output.audio_continuity_ok = continuity.is_continuous
+                output.audio_underrun_event_count = continuity.underrun_event_count
+                output.audio_continuity_measured = True
             output.latency = request_finished_at - output.start_time
             output.tts_turn_pcm_bytes = turn_pcm_bytes
             output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)

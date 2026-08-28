@@ -15,8 +15,11 @@ import pytest
 from pytest_mock import MockerFixture
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
+from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
+    _session_audio_continuity,
+    async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
@@ -46,6 +49,240 @@ class MockResponse:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
+
+
+# PCM s16le mono at 24 kHz -> 48 000 bytes/sec, so 4 800 bytes is 100 ms of audio.
+_SR = 24_000
+_CHUNK_BYTES = 4_800
+
+
+def _add_audio_response(
+    collector: RealtimeEventCollector,
+    response_id: str,
+    arrival_times_s: list[float],
+) -> None:
+    """Feed one response whose chunks each hold 100 ms of audio."""
+    collector.add(
+        {"type": "response.created", "response": {"id": response_id}},
+        received_at_s=arrival_times_s[0] - 0.01,
+    )
+    for received_at_s in arrival_times_s:
+        collector.add(
+            {
+                "type": "response.audio.delta",
+                "response_id": response_id,
+                "delta": base64.b64encode(b"\x00" * _CHUNK_BYTES).decode("ascii"),
+                "sample_rate_hz": _SR,
+            },
+            received_at_s=received_at_s,
+        )
+
+
+def test_session_continuity_scores_each_response_on_its_own_timeline():
+    """Silence between turns is the conversation working, not the player starving."""
+    collector = RealtimeEventCollector()
+    _add_audio_response(collector, "resp-a", [10.0, 10.1, 10.2])
+    # 20 s later: the user was speaking, or thinking.
+    _add_audio_response(collector, "resp-b", [30.0, 30.1, 30.2])
+
+    stats = _session_audio_continuity(
+        collector,
+        ["resp-a", "resp-b"],
+        sample_rate=_SR,
+        threshold_s=0.1,
+    )
+
+    assert stats is not None
+    assert stats.is_continuous is True
+    assert stats.max_underrun_s == pytest.approx(0.0)
+    assert stats.underrun_event_count == 0
+
+    # The same chunks scored as one concatenated session read the inter-turn
+    # silence as ~19.7 s of starvation. That is the bug this split avoids.
+    concatenated = compute_continuity_stats(
+        chunk_arrival_times_s=[10.0, 10.1, 10.2, 30.0, 30.1, 30.2],
+        chunk_bytes=[_CHUNK_BYTES] * 6,
+        sample_rate=_SR,
+        threshold_s=0.1,
+    )
+    assert concatenated.is_continuous is False
+    assert concatenated.max_underrun_s > 19.0
+
+
+def test_session_continuity_reports_the_worst_response_not_the_average():
+    collector = RealtimeEventCollector()
+    for index in range(9):
+        _add_audio_response(collector, f"clean-{index}", [index * 10.0, index * 10.0 + 0.1])
+    # One turn where the second chunk lands 0.5 s late: 0.4 s of dead air.
+    _add_audio_response(collector, "starved", [100.0, 100.5])
+
+    stats = _session_audio_continuity(
+        collector,
+        [f"clean-{index}" for index in range(9)] + ["starved"],
+        sample_rate=_SR,
+        threshold_s=0.1,
+    )
+
+    assert stats is not None
+    assert stats.is_continuous is False
+    # Averaging the ten turns would give 0.04 s and pass the 0.1 s budget.
+    assert stats.max_underrun_s == pytest.approx(0.4)
+    assert stats.underrun_event_count == 1
+
+
+def test_session_continuity_ignores_responses_that_carried_no_audio():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "listen-only"}}, received_at_s=0.0)
+    _add_audio_response(collector, "spoken", [1.0, 1.1])
+
+    stats = _session_audio_continuity(
+        collector,
+        ["listen-only", "spoken"],
+        sample_rate=_SR,
+        threshold_s=0.1,
+    )
+
+    assert stats is not None
+    assert stats.is_continuous is True
+    assert stats.underrun_event_count == 0
+
+
+def test_session_continuity_is_none_when_nothing_carried_audio():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "listen-only"}}, received_at_s=0.0)
+
+    assert _session_audio_continuity(collector, ["listen-only"], sample_rate=_SR, threshold_s=0.1) is None
+    assert _session_audio_continuity(collector, [], sample_rate=_SR, threshold_s=0.1) is None
+
+
+@pytest.mark.asyncio
+async def test_seed_tts_realtime_duplex_reports_audio_continuity(monkeypatch):
+    """The duplex backend must publish continuity, and flag that it measured it."""
+
+    class FakeRealtimeClient:
+        # Turn 0 stalls for 0.5 s between chunks; turn 1 streams cleanly.
+        turn_offsets = ([0.03, 0.60], [0.03, 0.13])
+
+        def __init__(self, url):
+            self.events = RealtimeEventCollector()
+            self.response_count = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def configure(self, model, **kwargs):
+            return None
+
+        async def send(self, event):
+            if event["type"] != "response.create":
+                return
+            response_id = f"resp-{self.response_count}"
+            offsets = self.turn_offsets[self.response_count]
+            self.response_count += 1
+            now = time.monotonic()
+            self.events.add(
+                {"type": "response.created", "response": {"id": response_id}},
+                received_at_s=now + 0.01,
+            )
+            self.events.add(
+                {
+                    "type": "response.audio_transcript.delta",
+                    "response_id": response_id,
+                    "delta": "spoken",
+                },
+                received_at_s=now + 0.02,
+            )
+            for offset in offsets:
+                self.events.add(
+                    {
+                        "type": "response.audio.delta",
+                        "response_id": response_id,
+                        "delta": base64.b64encode(b"\x00" * _CHUNK_BYTES).decode("ascii"),
+                        "sample_rate_hz": _SR,
+                        "metadata": {"audio_duration_ms": 100},
+                    },
+                    received_at_s=now + offset,
+                )
+            self.events.add(
+                {"type": "response.done", "response": {"id": response_id}},
+                received_at_s=now + offsets[-1] + 0.01,
+            )
+
+        async def acknowledge_playback(self):
+            return None
+
+        async def close_session(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(
+        "vllm_omni.benchmarks.patch.patch.RealtimeDuplexClient",
+        FakeRealtimeClient,
+    )
+    request_input = RequestFuncInput(
+        model="openbmb/MiniCPM-o-4_5",
+        model_name="openbmb/MiniCPM-o-4_5",
+        prompt="hello",
+        api_url="http://localhost:8000/v1/realtime",
+        prompt_len=1,
+        output_len=20,
+        logprobs=None,
+        multi_modal_content=None,
+        ignore_eos=False,
+        extra_body={},
+    )
+    request_input.seed_tts_turns = tuple(
+        SimpleNamespace(utterance_id=f"utt-{index}", target_text=f"text {index}") for index in range(2)
+    )
+
+    output = await async_request_openai_realtime_duplex(request_input, session=None)
+
+    assert output.success is True
+    assert output.audio_continuity_measured is True
+    assert output.audio_continuity_ok is False
+    # Turn 0: 0.57 s between chunks delivers only 0.1 s of audio -> 0.47 s starved.
+    assert output.audio_underrun_s == pytest.approx(0.47, abs=1e-3)
+    assert output.audio_underrun_event_count == 1
+
+
+def _speech_request_input() -> RequestFuncInput:
+    return RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="say something",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=3,
+        output_len=20,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_with_no_pcm_body_is_not_counted_as_measured(mocker: MockerFixture):
+    """A 200 that carries no audio must not vote a clean continuity score."""
+    mock_response = MockResponse(200, [b""])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(_speech_request_input(), mock_session)
+
+    assert output.success is True
+    assert output.audio_frames == 0
+    assert output.audio_continuity_measured is False
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_with_pcm_body_is_counted_as_measured(mocker: MockerFixture):
+    mock_response = MockResponse(200, [b"\x00" * _CHUNK_BYTES] * 3, delay_between_chunks=0.01)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(_speech_request_input(), mock_session)
+
+    assert output.success is True
+    assert output.audio_frames > 0
+    assert output.audio_continuity_measured is True
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,7 @@ A deficit > ``threshold_s`` at any point counts as an audible underrun.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -26,8 +27,11 @@ class ContinuityStats:
 
     Attributes:
         max_underrun_s: Worst-case wall-clock seconds the player was starved.
-        underrun_event_count: Inter-chunk intervals during which the buffer
-            went negative (one per gap, not per starved millisecond).
+        underrun_event_count: Inter-chunk intervals at whose end the buffer was
+            short by at least one sample frame. Playback is anchored at the
+            first chunk and never re-buffers, so after one stall the following
+            intervals stay short and are counted too: this is "intervals behind
+            schedule", not a count of distinct gaps.
         is_continuous: ``max_underrun_s <= threshold_s`` for the request.
     """
 
@@ -69,6 +73,15 @@ def compute_continuity_stats(
     if bytes_per_s <= 0:
         return ContinuityStats(0.0, 0, True)
 
+    # Smallest shortfall a listener could hear: one missing sample frame.
+    # Below that the arithmetic is dominated by float rounding -- differencing
+    # two wall-clock arrival times can leave a sub-nanosecond positive residue
+    # on a stream that was fed exactly on time, and a bare ``> 0`` test counts
+    # that as a gap. The deficits it invents are ~1e-15 s, invisible in
+    # ``max_underrun_s`` but not in the event tally: a clean ten-turn session
+    # was reporting six underrun events that never happened.
+    min_deficit_bytes = max(sample_width * channels, 1)
+
     t0 = chunk_arrival_times_s[0]
     received_before = 0
     max_underrun_s = 0.0
@@ -77,7 +90,7 @@ def compute_continuity_stats(
         if i > 0:
             played_bytes = (chunk_arrival_times_s[i] - t0) * bytes_per_s
             deficit_bytes = played_bytes - received_before
-            if deficit_bytes > 0:
+            if deficit_bytes >= min_deficit_bytes:
                 deficit_s = deficit_bytes / bytes_per_s
                 if deficit_s > max_underrun_s:
                     max_underrun_s = deficit_s
@@ -88,4 +101,34 @@ def compute_continuity_stats(
         max_underrun_s=max_underrun_s,
         underrun_event_count=event_count,
         is_continuous=max_underrun_s <= threshold_s,
+    )
+
+
+def roll_up_continuity_stats(per_response: Iterable[ContinuityStats]) -> ContinuityStats | None:
+    """Combine per-response stats into one verdict for a multi-response session.
+
+    Callers score each response on its own arrival timeline first. Running the
+    simulated player across a concatenated session instead would read the
+    silence between turns -- the model waiting on the next user utterance -- as
+    player starvation.
+
+    The roll-up is worst-case, never a mean: nine clean responses and one
+    audible 3 s gap must not average down to a passing 0.3 s.
+
+    Args:
+        per_response: Stats for the responses that actually carried audio.
+            Responses with no audio are the caller's to exclude -- scoring them
+            as a clean 0.0 s would inflate the result.
+
+    Returns:
+        The combined stats, or ``None`` when there is nothing to roll up, so
+        callers report "not measured" rather than a default-clean score.
+    """
+    stats = list(per_response)
+    if not stats:
+        return None
+    return ContinuityStats(
+        max_underrun_s=max(item.max_underrun_s for item in stats),
+        underrun_event_count=sum(item.underrun_event_count for item in stats),
+        is_continuous=all(item.is_continuous for item in stats),
     )

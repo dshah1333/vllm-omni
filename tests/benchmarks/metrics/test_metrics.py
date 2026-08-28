@@ -8,9 +8,14 @@ Unit tests for metrics.py
 import math
 
 import pytest
+from vllm.benchmarks.lib.endpoint_request_func import RequestFuncOutput
 from vllm.benchmarks.serve import TaskType
 
-from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
+from vllm_omni.benchmarks.metrics.metrics import (
+    calculate_metrics,
+    has_metric_samples,
+    print_audio_metrics,
+)
 from vllm_omni.benchmarks.patch.patch import MixRequestFuncOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
@@ -112,17 +117,154 @@ def test_total_input_aggregated_from_output_prompt_len():
     )
 
 
+def test_unmeasured_continuity_is_reported_as_no_samples():
+    """A backend that never timed a chunk must not publish a perfect score."""
+    outputs = [_make_output(100), _make_output(100)]
+    assert all(output.audio_continuity_measured is False for output in outputs)
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=outputs,
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.audio_continuity_measured_requests == 0
+    # The default-clean fields are still there, but the sample gate keeps them
+    # out of the printed table and the result JSON.
+    assert has_metric_samples(metrics, "audio_underrun") is False
+
+
+def test_partially_measured_continuity_counts_only_the_measured_requests():
+    measured = _make_output(100)
+    measured.audio_underrun_s = 0.4
+    measured.audio_continuity_ok = False
+    measured.audio_continuity_measured = True
+    unmeasured = _make_output(100)
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[measured, unmeasured],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.audio_continuity_measured_requests == 1
+    # The unmeasured request must not dilute the rate to 50%.
+    assert metrics.audio_continuity_ok_rate == pytest.approx(0.0)
+    assert metrics.mean_audio_underrun_s == pytest.approx(0.4)
+
+
+def test_unmeasured_continuity_prints_not_measured_and_omits_underrun_rows(capsys):
+    """The printed table is the thing users read; it must not claim a clean run."""
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[_make_output(100)],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+    capsys.readouterr()
+
+    print_audio_metrics(["audio_underrun"], metrics)
+    printed = capsys.readouterr().out
+
+    assert "not measured" in printed
+    assert "100.00%" not in printed
+    assert "AUDIO_UNDERRUN" not in printed
+
+
+def test_measured_continuity_prints_the_rate_with_its_sample_count(capsys):
+    measured = _make_output(100)
+    measured.audio_continuity_measured = True
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[measured],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+    capsys.readouterr()
+
+    print_audio_metrics(["audio_underrun"], metrics)
+    printed = capsys.readouterr().out
+
+    # A measured 100% and an unmeasured default 100% must not read the same.
+    assert "100.00% (1 measured)" in printed
+    assert "AUDIO_UNDERRUN" in printed
+
+
+def test_plain_upstream_request_output_aggregates_without_the_omni_fields():
+    """Plain-vLLM backends return outputs with no continuity attributes at all."""
+    plain = RequestFuncOutput()
+    plain.success = True
+    plain.prompt_len = 100
+    plain.output_tokens = 10
+    plain.generated_text = "x" * 10
+    plain.ttft = 0.1
+    plain.latency = 1.0
+    plain.start_time = 0.0
+    plain.itl = [0.1] * 9
+    assert not hasattr(plain, "audio_continuity_measured")
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[plain],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_underrun"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.completed == 1
+    assert metrics.audio_continuity_measured_requests == 0
+
+
 def test_audio_continuity_aggregation():
     """Continuity rate and underrun percentile must aggregate from per-output fields."""
     bad = _make_output(100)
     bad.audio_underrun_s = 0.5
     bad.audio_continuity_ok = False
+    bad.audio_continuity_measured = True
     good_a = _make_output(100)
     good_a.audio_underrun_s = 0.02
     good_a.audio_continuity_ok = True
+    good_a.audio_continuity_measured = True
     good_b = _make_output(100)
     good_b.audio_underrun_s = 0.0
     good_b.audio_continuity_ok = True
+    good_b.audio_continuity_measured = True
 
     metrics, _ = calculate_metrics(
         input_requests=[],
@@ -139,6 +281,7 @@ def test_audio_continuity_aggregation():
     )
 
     assert metrics.audio_continuity_ok_rate == pytest.approx(2 / 3, abs=1e-6)
+    assert metrics.audio_continuity_measured_requests == 3
     # p99 of [0.5, 0.02, 0.0] is dominated by the 0.5 outlier.
     p99 = dict(metrics.percentiles_audio_underrun_s).get(99.0)
     assert p99 is not None and p99 > 0.4
