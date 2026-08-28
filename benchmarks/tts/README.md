@@ -84,7 +84,9 @@ vllm bench serve --omni \
 
 `audio_underrun` (seconds) is the per-request worst-case buffer deficit
 under a realtime-rate player simulation. The audio-speech backend records
-chunk arrival times during the SSE stream and surfaces:
+chunk arrival times during the SSE stream; the Realtime backends
+(`openai-realtime-tts` / `openai-realtime-duplex`) record them per response
+over the WebSocket. Both surface:
 
 - `Mean / Median / P{50,99} AUDIO_UNDERRUN (s)` per the standard percentile
   output - any positive value means at least one inter-chunk gap was longer
@@ -97,6 +99,13 @@ chunk arrival times during the SSE stream and surfaces:
 This captures the failure mode where `RTF_p50 < 1` (server keeps up in
 aggregate) but per-stream chunk arrival is bursty enough that listeners
 still hear gaps - common at high concurrency on streaming TTS pipelines.
+
+On a multi-turn Realtime session each response is scored on its own arrival
+timeline and the results are combined worst-case, so the silence between
+turns is not counted as starvation and one bad turn cannot be averaged away
+by the clean ones. Backends that do not time audio chunks report
+`Streaming continuity OK rate: not measured` and omit the underrun rows
+rather than publishing a default-clean score.
 
 #### Add WER / SIM / UTMOS to any of the above
 
