@@ -27,9 +27,11 @@ class ContinuityStats:
 
     Attributes:
         max_underrun_s: Worst-case wall-clock seconds the player was starved.
-        underrun_event_count: Inter-chunk intervals during which the buffer
-            went short by at least one sample frame (one per gap, not per
-            starved millisecond).
+        underrun_event_count: Inter-chunk intervals at whose end the buffer was
+            short by at least one sample frame. Playback is anchored at the
+            first chunk and never re-buffers, so after one stall the following
+            intervals stay short and are counted too: this is "intervals behind
+            schedule", not a count of distinct gaps.
         is_continuous: ``max_underrun_s <= threshold_s`` for the request.
     """
 

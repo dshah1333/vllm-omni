@@ -19,6 +19,7 @@ from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.patch.patch import (
     MixRequestFuncOutput,
     _session_audio_continuity,
+    async_request_openai_audio_speech,
     async_request_openai_chat_omni_completions,
     async_request_openai_realtime_duplex,
 )
@@ -244,6 +245,44 @@ async def test_seed_tts_realtime_duplex_reports_audio_continuity(monkeypatch):
     # Turn 0: 0.57 s between chunks delivers only 0.1 s of audio -> 0.47 s starved.
     assert output.audio_underrun_s == pytest.approx(0.47, abs=1e-3)
     assert output.audio_underrun_event_count == 1
+
+
+def _speech_request_input() -> RequestFuncInput:
+    return RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="say something",
+        api_url="http://test.com/v1/audio/speech",
+        prompt_len=3,
+        output_len=20,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_with_no_pcm_body_is_not_counted_as_measured(mocker: MockerFixture):
+    """A 200 that carries no audio must not vote a clean continuity score."""
+    mock_response = MockResponse(200, [b""])
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(_speech_request_input(), mock_session)
+
+    assert output.success is True
+    assert output.audio_frames == 0
+    assert output.audio_continuity_measured is False
+
+
+@pytest.mark.asyncio
+async def test_audio_speech_with_pcm_body_is_counted_as_measured(mocker: MockerFixture):
+    mock_response = MockResponse(200, [b"\x00" * _CHUNK_BYTES] * 3, delay_between_chunks=0.01)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_audio_speech(_speech_request_input(), mock_session)
+
+    assert output.success is True
+    assert output.audio_frames > 0
+    assert output.audio_continuity_measured is True
 
 
 @pytest.mark.asyncio

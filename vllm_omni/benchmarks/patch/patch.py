@@ -1451,18 +1451,22 @@ async def async_request_openai_audio_speech(
                 if output.audio_duration <= 0:
                     logger.warning("Audio duration is zero")
 
-                continuity = compute_continuity_stats(
-                    chunk_arrival_times_s=chunk_arrival_times_s,
-                    chunk_bytes=chunk_sizes,
-                    sample_rate=sample_rate,
-                    sample_width=sample_width,
-                    channels=channels,
-                    threshold_s=_audio_continuity_threshold_s(),
-                )
-                output.audio_underrun_s = continuity.max_underrun_s
-                output.audio_continuity_ok = continuity.is_continuous
-                output.audio_underrun_event_count = continuity.underrun_event_count
-                output.audio_continuity_measured = True
+                if chunk_sizes:
+                    # A 200 with no PCM body is a real outcome here (the server
+                    # logs status=ok first_chunk_ms=NA). Scoring that empty
+                    # response clean would let it vote in the continuity rate.
+                    continuity = compute_continuity_stats(
+                        chunk_arrival_times_s=chunk_arrival_times_s,
+                        chunk_bytes=chunk_sizes,
+                        sample_rate=sample_rate,
+                        sample_width=sample_width,
+                        channels=channels,
+                        threshold_s=_audio_continuity_threshold_s(),
+                    )
+                    output.audio_underrun_s = continuity.max_underrun_s
+                    output.audio_continuity_ok = continuity.is_continuous
+                    output.audio_underrun_event_count = continuity.underrun_event_count
+                    output.audio_continuity_measured = True
                 if pcm_capture is not None and pcm_capture:
                     try:
                         output.tts_output_pcm_bytes = _pcm_s16le_to_seed_tts_wer_bytes(
