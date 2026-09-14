@@ -141,15 +141,37 @@ def _state(output_kind):
 @pytest.mark.parametrize("batch_later_chunks", [False, True])
 @pytest.mark.parametrize("finish_with_payload", [False, True])
 @pytest.mark.parametrize("explicit_sampling", [False, True])
+@pytest.mark.parametrize("lengths", [(5000, 5000, 5000), (0, 5000, 0, 2000, 5000)])
 async def test_real_producer_deltas_reach_video_client(
-    monkeypatch, wire_mode, delta_mode, batch_later_chunks, finish_with_payload, explicit_sampling
+    monkeypatch, wire_mode, delta_mode, batch_later_chunks, finish_with_payload, explicit_sampling, lengths
 ):
     monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", wire_mode)
     monkeypatch.setenv("VLLM_VIDEO_AUDIO_DELTA_MODE", delta_mode)
-    chunks = _chunks()
+    chunks = []
+    offset = 0
+    for length in lengths:
+        # Qwen's generation runner hands off [1, samples] CPU tensors.
+        chunks.append(torch.arange(offset, offset + length, dtype=torch.float32).reshape(1, -1) / 32768)
+        offset += length
     groups = [[chunks[0]], chunks[1:]] if batch_later_chunks else [[chunk] for chunk in chunks]
     state = _state(RequestOutputKind.DELTA)
     snapshots = []
+    produced = []
+    # Complete production before consumption: retained DELTA snapshots must
+    # survive subsequent accumulation and draining under consumer backpressure.
+    for index, group in enumerate(groups):
+        for chunk in group:
+            state.add_multimodal_tensor(chunk, mm_type="audio")
+        finish = FinishReason.STOP if finish_with_payload and index == len(groups) - 1 else None
+        result = state.make_request_output([], None, finish, None)
+        assert result is not None
+        assert "audio" not in state.mm_accumulated
+        snapshots.append(result.outputs[0].multimodal_output["audio"])
+        produced.append(OmniRequestOutput.from_stage_output(result, final_output_type="audio"))
+    if not finish_with_payload:
+        result = state.make_request_output([], None, FinishReason.STOP, None)
+        assert result is not None
+        produced.append(OmniRequestOutput.from_stage_output(result, final_output_type="audio"))
 
     class Engine:
         async def generate(self, *, prompt, request_id, output_modalities, sampling_params_list=None):
@@ -159,19 +181,8 @@ async def test_real_producer_deltas_reach_video_client(
             else:
                 assert sampling_params_list is None
             # AsyncOmni coerces omitted parameters to DELTA as well.
-            for index, group in enumerate(groups):
-                for chunk in group:
-                    state.add_multimodal_tensor(chunk, mm_type="audio")
-                finish = FinishReason.STOP if finish_with_payload and index == len(groups) - 1 else None
-                result = state.make_request_output([], None, finish, None)
-                assert result is not None
-                assert "audio" not in state.mm_accumulated
-                snapshots.append(result.outputs[0].multimodal_output["audio"])
-                yield OmniRequestOutput.from_stage_output(result, final_output_type="audio")
-            if not finish_with_payload:
-                result = state.make_request_output([], None, FinishReason.STOP, None)
-                assert result is not None
-                yield OmniRequestOutput.from_stage_output(result, final_output_type="audio")
+            for result in produced:
+                yield result
 
     class Handler(QwenOmniStreamingVideoHandler):
         async def _preprocess_to_engine_prompt(self, request):
@@ -204,15 +215,16 @@ async def test_real_producer_deltas_reach_video_client(
     )
     assert not any(message["type"] == "error" for message in ws.sent)
     audio = [message for message in ws.sent if message["type"] == "response.output_audio.delta"]
-    assert len(audio) == (len(groups) if wire_mode == "on" else 1)
+    nonempty_groups = sum(any(chunk.numel() for chunk in group) for group in groups)
+    assert len(audio) == (nonempty_groups if wire_mode == "on" else 1)
     np.testing.assert_array_equal(
         np.concatenate([_pcm(message["data"]) for message in audio]),
-        np.arange(_CODEC_FRAME_SAMPLES, 15000),
+        np.arange(_CODEC_FRAME_SAMPLES, sum(lengths)),
     )
     assert sum(message["type"] == "response.output_audio.done" for message in ws.sent) == 1
     assert torch.equal(snapshots[0], chunks[0])
-    last = torch.cat(snapshots[-1]) if isinstance(snapshots[-1], list) else snapshots[-1]
-    assert torch.equal(last, torch.cat(groups[-1]))
+    last = torch.cat(snapshots[-1], dim=-1) if isinstance(snapshots[-1], list) else snapshots[-1]
+    assert torch.equal(last, torch.cat(groups[-1], dim=-1))
 
 
 def test_cumulative_producer_is_a_different_contract():
